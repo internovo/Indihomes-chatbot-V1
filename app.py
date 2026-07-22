@@ -194,8 +194,12 @@ def debug_location(req: LocationRequest):
 
 def _advisor_display_name(email: str) -> str:
     """Best-effort friendly name from an advisor's email, e.g.
-    'arpit@internovo.in' -> 'Arpit'. We don't store real names anywhere."""
+    'arpit@internovo.in' -> 'Arpit'. We don't store real names anywhere.
+    'tech@...' is a generic internal inbox, not a person - show it as
+    'Our Advisor' instead of 'Tech'."""
     local = (email or "").split("@")[0]
+    if local.lower() == "tech":
+        return "Our Advisor"
     parts = re.split(r"[._]+", local)
     return " ".join(p.capitalize() for p in parts if p) or "Your advisor"
 
