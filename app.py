@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
+import re
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional
@@ -39,6 +40,8 @@ from llm_location import (
     LocationRequest,
     GROQ_MODEL,
 )
+import calendar_service
+import appointments_db
 
 app = FastAPI()
 
@@ -189,13 +192,166 @@ def debug_location(req: LocationRequest):
     return location_debug_handler(req)
 
 
+def _advisor_display_name(email: str) -> str:
+    """Best-effort friendly name from an advisor's email, e.g.
+    'arpit@internovo.in' -> 'Arpit'. We don't store real names anywhere."""
+    local = (email or "").split("@")[0]
+    parts = re.split(r"[._]+", local)
+    return " ".join(p.capitalize() for p in parts if p) or "Your advisor"
+
+
+def _parse_choice(choice: str, slot_count: int) -> Optional[int]:
+    """Accepts '2', 'option 2', '2nd', etc. Returns a 1-based index within
+    range, or None if it can't be parsed / is out of range."""
+    if not choice:
+        return None
+    m = re.search(r"\d+", choice)
+    if not m:
+        return None
+    n = int(m.group())
+    if 1 <= n <= slot_count:
+        return n
+    return None
+
+
+class AvailableSlotsRequest(BaseModel):
+    phone: Optional[str] = ""
+    appt_type: Optional[str] = "site_visit"
+
+
+@app.post("/available-slots")
+def available_slots(req: AvailableSlotsRequest):
+    """Shows the customer real free slots from the shared calendar, and
+    remembers them (keyed on phone) so /book-slot can resolve their reply."""
+    phone = _clean_incoming(req.phone)
+    appt_type = _clean_incoming(req.appt_type) or "site_visit"
+
+    if not phone:
+        return {
+            "slots_text": "I couldn't find your number to check slots against. "
+                          "One of our advisors will call you shortly to arrange a time.",
+            "has_slots": "no",
+            "slot_count": 0,
+        }
+
+    try:
+        slots = calendar_service.get_free_slots(days_ahead=5, limit=5)
+    except Exception:
+        slots = []
+
+    if not slots:
+        return {
+            "slots_text": "I couldn't find an open slot right now, but one of our advisors "
+                          "will call you shortly to arrange a time that works for you.",
+            "has_slots": "no",
+            "slot_count": 0,
+        }
+
+    appointments_db.save_pending_slots(phone, slots)
+    slots_text = "\n".join(f"{s['index']}. {s['label']}" for s in slots)
+    return {
+        "slots_text": slots_text,
+        "has_slots": "yes",
+        "slot_count": len(slots),
+    }
+
+
+class BookSlotRequest(BaseModel):
+    phone: Optional[str] = ""
+    choice: Optional[str] = ""
+    name: Optional[str] = ""
+    appt_type: Optional[str] = "site_visit"
+    property_ref: Optional[str] = ""
+
+
+@app.post("/book-slot")
+def book_slot(req: BookSlotRequest):
+    """Resolves the customer's numbered reply against the slots we showed
+    them, books the calendar event, and stores the appointment."""
+    phone = _clean_incoming(req.phone)
+    choice = _clean_incoming(req.choice)
+    name = _clean_incoming(req.name)
+    appt_type = _clean_incoming(req.appt_type) or "site_visit"
+    property_ref = _clean_incoming(req.property_ref)
+
+    fallback_message = "One of our advisors will call you shortly to arrange a time."
+
+    if not phone:
+        return {"booked": "no", "message": fallback_message, "advisor": "", "slot_label": ""}
+
+    pending = appointments_db.get_pending_slots(phone)
+    if not pending:
+        return {
+            "booked": "no",
+            "message": "That slot list has expired. Please ask for available slots again.",
+            "advisor": "", "slot_label": "",
+        }
+
+    idx = _parse_choice(choice, len(pending))
+    if idx is None:
+        return {
+            "booked": "no",
+            "message": f"Please reply with a number between 1 and {len(pending)} to pick a slot.",
+            "advisor": "", "slot_label": "",
+        }
+
+    slot = pending[idx - 1]
+
+    if appointments_db.is_slot_taken(slot["start_iso"]):
+        return {
+            "booked": "no",
+            "message": "Sorry, that slot was just taken. Please ask for available slots again.",
+            "advisor": "", "slot_label": "",
+        }
+
+    advisors = calendar_service.advisor_emails()
+    advisor_email = appointments_db.next_advisor(advisors) or ""
+
+    event_id = None
+    try:
+        event_id = calendar_service.create_event(
+            slot_iso=slot["start_iso"],
+            customer_name=name,
+            customer_phone=phone,
+            advisor_email=advisor_email,
+            notes=f"Type: {appt_type}" + (f", Property: {property_ref}" if property_ref else ""),
+        )
+    except Exception:
+        event_id = None
+
+    if event_id is None:
+        return {"booked": "no", "message": fallback_message, "advisor": "", "slot_label": ""}
+
+    appointments_db.save_appointment(
+        lead_phone=phone,
+        lead_name=name,
+        advisor_email=advisor_email,
+        property_ref=property_ref,
+        google_event_id=event_id,
+        slot_start=slot["start_iso"],
+        appt_type=appt_type,
+    )
+    appointments_db.clear_pending_slots(phone)
+
+    advisor_name = _advisor_display_name(advisor_email)
+    return {
+        "booked": "yes",
+        "message": f"Appointment confirmed for {slot['label']}. Our Advisor from Indihomes will Contact you.",
+        "advisor": advisor_name,
+        "slot_label": slot["label"],
+    }
+
+
 @app.get("/health")
 def health():
     groq = os.environ.get("GROQ_API_KEY") or ""
     llm = ("groq: loaded (ends ..." + groq[-4:] + "), model=" + GROQ_MODEL) if groq else "NO KEY LOADED"
+    calendar_status = "connected" if calendar_service.is_configured() else "NOT CONFIGURED"
     return {
         "status": "ok",
         "properties_loaded": len(PROPERTIES),
         "known_localities": KNOWN_LOCALITIES,
         "llm": llm,
+        "calendar": calendar_status,
+        "advisors_loaded": len(calendar_service.advisor_emails()),
     }

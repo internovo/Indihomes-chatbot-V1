@@ -1,0 +1,144 @@
+"""
+SQLite storage for appointment booking.
+
+Two tables:
+  appointments   - confirmed bookings.
+  pending_slots  - the numbered list we last showed each phone number, so
+                   /book-slot can resolve "2" back to an actual slot. Keyed
+                   on phone since WATI conversations don't carry state for us.
+"""
+
+import json
+import os
+import sqlite3
+from datetime import datetime
+from typing import Dict, List, Optional
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(HERE, "appointments.db")
+
+
+def _connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = _connect()
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS appointments (
+              appointment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+              lead_phone     TEXT,
+              lead_name      TEXT,
+              advisor_email  TEXT,
+              property_ref   TEXT,
+              google_event_id TEXT,
+              slot_start     TEXT,
+              appt_type      TEXT,
+              status         TEXT,
+              created_at     TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_slots (
+              lead_phone TEXT PRIMARY KEY,
+              slots_json TEXT,
+              created_at TEXT
+            )
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+init_db()
+
+
+def save_pending_slots(phone: str, slots: List[Dict]):
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT INTO pending_slots (lead_phone, slots_json, created_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(lead_phone) DO UPDATE SET slots_json=excluded.slots_json, created_at=excluded.created_at",
+            (phone, json.dumps(slots), datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_pending_slots(phone: str) -> List[Dict]:
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT slots_json FROM pending_slots WHERE lead_phone = ?", (phone,)
+        ).fetchone()
+        if not row:
+            return []
+        try:
+            return json.loads(row["slots_json"])
+        except (TypeError, ValueError):
+            return []
+    finally:
+        conn.close()
+
+
+def clear_pending_slots(phone: str):
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM pending_slots WHERE lead_phone = ?", (phone,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_appointment(lead_phone: str, lead_name: str, advisor_email: str,
+                      property_ref: str, google_event_id: Optional[str],
+                      slot_start: str, appt_type: str) -> int:
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "INSERT INTO appointments "
+            "(lead_phone, lead_name, advisor_email, property_ref, google_event_id, "
+            " slot_start, appt_type, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (lead_phone, lead_name, advisor_email, property_ref, google_event_id,
+             slot_start, appt_type, "confirmed", datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def is_slot_taken(slot_start: str) -> bool:
+    """Guards against double-booking the same slot (e.g. a duplicate WATI
+    webhook retry, or two people booking the same free slot before Google
+    Calendar reflects the first one)."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM appointments WHERE slot_start = ? AND status = 'confirmed'",
+            (slot_start,),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def next_advisor(advisor_emails: List[str]) -> Optional[str]:
+    """Round-robin across the configured advisors, based on how many
+    confirmed appointments have been booked so far."""
+    if not advisor_emails:
+        return None
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM appointments WHERE status = 'confirmed'"
+        ).fetchone()
+        count = row["n"] if row else 0
+        return advisor_emails[count % len(advisor_emails)]
+    finally:
+        conn.close()
