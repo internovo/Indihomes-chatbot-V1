@@ -1,0 +1,796 @@
+{
+  "id": null,
+  "tenantId": "10195694",
+  "name": "Indihomes Property Assistant_1_1",
+  "created": null,
+  "flowNodes": [
+    {
+      "interactiveButtonsHeader": {
+        "type": "Text",
+        "text": "",
+        "media": null
+      },
+      "interactiveButtonsBody": "<p>Is now a good time?</p>",
+      "interactiveButtonsFooter": "Indihomes",
+      "interactiveButtonsItems": [
+        {
+          "id": "btn_yes",
+          "buttonText": "Yes, go ahead",
+          "nodeResultId": "main_buttons-city"
+        },
+        {
+          "id": "btn_later",
+          "buttonText": "Maybe later",
+          "nodeResultId": "main_message-later"
+        }
+      ],
+      "interactiveButtonsUserInputVariable": "consent",
+      "interactiveButtonsDefaultNodeResultId": "",
+      "id": "main_buttons-consent",
+      "flowNodeType": "InteractiveButtons",
+      "flowNodePosition": {
+        "posX": "-531",
+        "posY": "-469"
+      },
+      "isStartNode": false
+    },
+    {
+      "flowReplies": [
+        {
+          "flowReplyType": "Text",
+          "data": "<p>No problem at all. An Indihomes advisor will reach out at a better time.</p>\n<p>Whenever you're ready, just message us here.</p>",
+          "caption": "",
+          "mimeType": ""
+        }
+      ],
+      "id": "main_message-later",
+      "flowNodeType": "Message",
+      "flowNodePosition": {
+        "posX": "-452",
+        "posY": "-110"
+      },
+      "isStartNode": false
+    },
+    {
+      "interactiveButtonsHeader": {
+        "type": "Text",
+        "text": "",
+        "media": null
+      },
+      "interactiveButtonsBody": "<p>Which area are you looking in? We specialise in the western suburbs.</p>",
+      "interactiveButtonsFooter": "Choose an area",
+      "interactiveButtonsItems": [
+        {
+          "id": "loc_gore",
+          "buttonText": "Goregaon",
+          "nodeResultId": "main_buttons-config"
+        },
+        {
+          "id": "loc_malad",
+          "buttonText": "Malad",
+          "nodeResultId": "main_buttons-config"
+        },
+        {
+          "id": "loc_more",
+          "buttonText": "Other Area",
+          "nodeResultId": "main_question-wYPyQ"
+        }
+      ],
+      "interactiveButtonsUserInputVariable": "location",
+      "interactiveButtonsDefaultNodeResultId": "",
+      "id": "main_buttons-city",
+      "flowNodeType": "InteractiveButtons",
+      "flowNodePosition": {
+        "posX": "-26",
+        "posY": "-627"
+      },
+      "isStartNode": false
+    },
+    {
+      "interactiveButtonsHeader": {
+        "type": "Text",
+        "text": "",
+        "media": null
+      },
+      "interactiveButtonsBody": "<p>Great. What type of home are you looking for?</p>",
+      "interactiveButtonsFooter": "Choose one",
+      "interactiveButtonsItems": [
+        {
+          "id": "cfg_1",
+          "buttonText": "1 BHK",
+          "nodeResultId": "main_buttons-budget"
+        },
+        {
+          "id": "cfg_2",
+          "buttonText": "2 BHK",
+          "nodeResultId": "main_buttons-budget"
+        },
+        {
+          "id": "cfg_3",
+          "buttonText": "3 BHK / Larger",
+          "nodeResultId": "main_buttons-budget"
+        }
+      ],
+      "interactiveButtonsUserInputVariable": "configuration",
+      "interactiveButtonsDefaultNodeResultId": "",
+      "id": "main_buttons-config",
+      "flowNodeType": "InteractiveButtons",
+      "flowNodePosition": {
+        "posX": "555",
+        "posY": "-630"
+      },
+      "isStartNode": false
+    },
+    {
+      "interactiveButtonsHeader": {
+        "type": "Text",
+        "text": "",
+        "media": null
+      },
+      "interactiveButtonsBody": "<p>What's your comfortable budget range?</p>\n<p>This helps us recommend only properties that genuinely fit your requirements.</p>",
+      "interactiveButtonsFooter": "Choose a range",
+      "interactiveButtonsItems": [
+        {
+          "id": "bud_1",
+          "buttonText": "Under 1 Cr",
+          "nodeResultId": "main_buttons-flex"
+        },
+        {
+          "id": "bud_2",
+          "buttonText": "1 Cr - 2 Cr",
+          "nodeResultId": "main_buttons-flex"
+        },
+        {
+          "id": "bud_3",
+          "buttonText": "Above 2 Cr",
+          "nodeResultId": "main_buttons-flex"
+        }
+      ],
+      "interactiveButtonsUserInputVariable": "budget",
+      "interactiveButtonsDefaultNodeResultId": "",
+      "id": "main_buttons-budget",
+      "flowNodeType": "InteractiveButtons",
+      "flowNodePosition": {
+        "posX": "989",
+        "posY": "-566"
+      },
+      "isStartNode": false
+    },
+    {
+      "interactiveButtonsHeader": {
+        "type": "Text",
+        "text": "",
+        "media": null
+      },
+      "interactiveButtonsBody": "<p>Is that a firm budget, or is there some room to stretch for the right place?</p>",
+      "interactiveButtonsFooter": "Indihomes",
+      "interactiveButtonsItems": [
+        {
+          "id": "flex_fixed",
+          "buttonText": "Pretty Firm",
+          "nodeResultId": "main_buttons-purpose"
+        },
+        {
+          "id": "flex_flex",
+          "buttonText": "Some Flexibility",
+          "nodeResultId": "main_buttons-purpose"
+        }
+      ],
+      "interactiveButtonsUserInputVariable": "budget_flexibility",
+      "interactiveButtonsDefaultNodeResultId": "",
+      "id": "main_buttons-flex",
+      "flowNodeType": "InteractiveButtons",
+      "flowNodePosition": {
+        "posX": "1381",
+        "posY": "-625"
+      },
+      "isStartNode": false
+    },
+    {
+      "interactiveButtonsHeader": {
+        "type": "Text",
+        "text": "",
+        "media": null
+      },
+      "interactiveButtonsBody": "<p>Is this for your own use or more of an investment?</p>",
+      "interactiveButtonsFooter": "Indihomes",
+      "interactiveButtonsItems": [
+        {
+          "id": "pur_self",
+          "buttonText": "Own Use",
+          "nodeResultId": "main_buttons-priority"
+        },
+        {
+          "id": "pur_inv",
+          "buttonText": "Investment",
+          "nodeResultId": "main_buttons-priority"
+        }
+      ],
+      "interactiveButtonsUserInputVariable": "purpose",
+      "interactiveButtonsDefaultNodeResultId": "",
+      "id": "main_buttons-purpose",
+      "flowNodeType": "InteractiveButtons",
+      "flowNodePosition": {
+        "posX": "1750",
+        "posY": "-596"
+      },
+      "isStartNode": false
+    },
+    {
+      "interactiveButtonsHeader": {
+        "type": "Text",
+        "text": "",
+        "media": null
+      },
+      "interactiveButtonsBody": "<p>One last thing - what matters most to you in this home?</p>",
+      "interactiveButtonsFooter": "Pick what's most important",
+      "interactiveButtonsItems": [
+        {
+          "id": "pri_poss",
+          "buttonText": " Near Possession",
+          "nodeResultId": "main_buttons-possession"
+        },
+        {
+          "id": "pri_amen",
+          "buttonText": "Amenities",
+          "nodeResultId": "main_question-jzbHS"
+        },
+        {
+          "id": "pri_build",
+          "buttonText": "A Reputed Builder",
+          "nodeResultId": "main_question-GLNoN"
+        }
+      ],
+      "interactiveButtonsUserInputVariable": "priority",
+      "interactiveButtonsDefaultNodeResultId": "",
+      "id": "main_buttons-priority",
+      "flowNodeType": "InteractiveButtons",
+      "flowNodePosition": {
+        "posX": "2100",
+        "posY": "-600"
+      },
+      "isStartNode": false
+    },
+    {
+      "interactiveButtonsHeader": {
+        "type": "Text",
+        "text": "",
+        "media": null
+      },
+      "interactiveButtonsBody": "<p>Would you like ready-to-move-in only, or is possession in the next 6-12 months also fine?</p>",
+      "interactiveButtonsFooter": "Indihomes",
+      "interactiveButtonsItems": [
+        {
+          "id": "pos_ready",
+          "buttonText": "Ready Only",
+          "nodeResultId": "main_webhook-dcBeI"
+        },
+        {
+          "id": "pos_near",
+          "buttonText": "6-12 Months is fine",
+          "nodeResultId": "main_webhook-dcBeI"
+        },
+        {
+          "id": "MmNhHfj",
+          "buttonText": "Just Exploring",
+          "nodeResultId": "main_webhook-dcBeI"
+        }
+      ],
+      "interactiveButtonsUserInputVariable": "possession_pref",
+      "interactiveButtonsDefaultNodeResultId": "",
+      "id": "main_buttons-possession",
+      "flowNodeType": "InteractiveButtons",
+      "flowNodePosition": {
+        "posX": "2473",
+        "posY": "-1026"
+      },
+      "isStartNode": false
+    },
+    {
+      "flowReplies": [
+        {
+          "flowReplyType": "Text",
+          "data": "<p>Thanks. Based on what you've told me, here are a few properties that fit well:</p>\n<p><br></p>\n<p>{{recommendations}}</p>\n<p><br></p>\n<p>If none of these feel right, just tell me what to change and I'll pull up more.</p>",
+          "caption": "",
+          "mimeType": ""
+        }
+      ],
+      "id": "main_message-recommend",
+      "flowNodeType": "Message",
+      "flowNodePosition": {
+        "posX": "3068",
+        "posY": "-597"
+      },
+      "isStartNode": false
+    },
+    {
+      "interactiveButtonsHeader": {
+        "type": "Text",
+        "text": "",
+        "media": null
+      },
+      "interactiveButtonsBody": "<p>Would you like one of our property advisors to help you explore these options further?</p>",
+      "interactiveButtonsFooter": "Indihomes",
+      "interactiveButtonsItems": [
+        {
+          "id": "nxt_visit",
+          "buttonText": "Book a Site Visit",
+          "nodeResultId": "main_question-McYWk"
+        },
+        {
+          "id": "nxt_advisor",
+          "buttonText": "Talk to an Advisor",
+          "nodeResultId": "main_message-advisor"
+        },
+        {
+          "id": "nxt_loan",
+          "buttonText": "Not Right Now",
+          "nodeResultId": "main_buttons-wFpLC"
+        }
+      ],
+      "interactiveButtonsUserInputVariable": "next_step",
+      "interactiveButtonsDefaultNodeResultId": "",
+      "id": "main_buttons-next",
+      "flowNodeType": "InteractiveButtons",
+      "flowNodePosition": {
+        "posX": "3498",
+        "posY": "-598"
+      },
+      "isStartNode": false
+    },
+    {
+      "flowReplies": [
+        {
+          "flowReplyType": "Text",
+          "data": "<p>Perfect, I'll set that up. I'll also shortlist a couple more options so you can compare a few during your visit.</p>\n<p><br></p>\n<p>An Indihomes advisor will confirm the details with you shortly.</p>",
+          "caption": "",
+          "mimeType": ""
+        }
+      ],
+      "id": "main_message-visitconfirm",
+      "flowNodeType": "Message",
+      "flowNodePosition": {
+        "posX": "4200",
+        "posY": "-900"
+      },
+      "isStartNode": false
+    },
+    {
+      "flowReplies": [
+        {
+          "flowReplyType": "Text",
+          "data": "<p>Sure. I've noted your requirements and an Indihomes advisor will connect with you shortly to walk you through pricing, availability and the next steps.</p>",
+          "caption": "",
+          "mimeType": ""
+        }
+      ],
+      "id": "main_message-advisor",
+      "flowNodeType": "Message",
+      "flowNodePosition": {
+        "posX": "3864",
+        "posY": "-666"
+      },
+      "isStartNode": false
+    },
+    {
+      "flowReplies": [
+        {
+          "flowReplyType": "Text",
+          "data": "<p>Thank you for your time. I've noted everything down, and an Indihomes advisor will be in touch soon to help you take the next step.</p>\n<p>Have a great day.</p>",
+          "caption": "",
+          "mimeType": ""
+        }
+      ],
+      "id": "main_message-close",
+      "flowNodeType": "Message",
+      "flowNodePosition": {
+        "posX": "4550",
+        "posY": "-600"
+      },
+      "isStartNode": false
+    },
+    {
+      "flowReplies": [
+        {
+          "flowReplyType": "Text",
+          "data": "<p>Which area works best for you?</p>",
+          "caption": "",
+          "mimeType": ""
+        }
+      ],
+      "userInputVariable": "location",
+      "answerValidation": {
+        "type": "None",
+        "minValue": "",
+        "maxValue": "",
+        "regex": "",
+        "fallback": "I'm afraid I didn't understand, could you try again, please?",
+        "failsCount": "3"
+      },
+      "isMediaAccepted": false,
+      "expectedAnswers": null,
+      "id": "main_question-wYPyQ",
+      "flowNodeType": "Question",
+      "flowNodePosition": {
+        "posX": "248",
+        "posY": "-824"
+      },
+      "isStartNode": false
+    },
+    {
+      "flowReplies": [
+        {
+          "flowReplyType": "Text",
+          "data": "<p>Which amenities matter to you? For example gym, parking, swimming pool, kids' play area.</p>",
+          "caption": "",
+          "mimeType": ""
+        }
+      ],
+      "userInputVariable": "amenities",
+      "answerValidation": {
+        "type": "None",
+        "minValue": "",
+        "maxValue": "",
+        "regex": "",
+        "fallback": "I'm afraid I didn't understand, could you try again, please?",
+        "failsCount": "3"
+      },
+      "isMediaAccepted": false,
+      "expectedAnswers": null,
+      "id": "main_question-jzbHS",
+      "flowNodeType": "Question",
+      "flowNodePosition": {
+        "posX": "2454",
+        "posY": "-597"
+      },
+      "isStartNode": false
+    },
+    {
+      "flowReplies": [
+        {
+          "flowReplyType": "Text",
+          "data": "<p>Any builders you prefer? Godrej, Lodha, Oberoi, Runwal, or someone else?</p>",
+          "caption": "",
+          "mimeType": ""
+        }
+      ],
+      "userInputVariable": "builder_pref",
+      "answerValidation": {
+        "type": "None",
+        "minValue": "",
+        "maxValue": "",
+        "regex": "",
+        "fallback": "I'm afraid I didn't understand, could you try again, please?",
+        "failsCount": "3"
+      },
+      "isMediaAccepted": false,
+      "expectedAnswers": null,
+      "id": "main_question-GLNoN",
+      "flowNodeType": "Question",
+      "flowNodePosition": {
+        "posX": "2429",
+        "posY": "-274"
+      },
+      "isStartNode": false
+    },
+    {
+      "methodType": "Post",
+      "url": "https://jawed-oven-climate.ngrok-free.dev/search",
+      "headers": [
+        {
+          "headerName": "Content-Type",
+          "headerValue": "application/json"
+        },
+        {
+          "headerName": "ngrok-skip-browser-warning",
+          "headerValue": "true"
+        }
+      ],
+      "body": "{\n  \"location\": \"{{location}}\",\n  \"message\": \"{{location}}\",\n  \"configuration\": \"{{configuration}}\",\n  \"budget\": \"{{budget}}\",\n  \"amenities\": \"{{amenities}}\",\n  \"possession_pref\": \"{{possession_pref}}\"\n}",
+      "testVariables": [
+        {
+          "name": "@location",
+          "value": "I want a home in Dahisar"
+        },
+        {
+          "name": "@configuration",
+          "value": "1 BHK"
+        },
+        {
+          "name": "@budget",
+          "value": "Under 1 Cr"
+        },
+        {
+          "name": "@possession_pref",
+          "value": "Ready Only"
+        }
+      ],
+      "responseVariables": [
+        {
+          "type": "ContactCustomParameter",
+          "name": "recommendations",
+          "path": "recommendations"
+        }
+      ],
+      "expectedStatuses": [],
+      "id": "main_webhook-dcBeI",
+      "flowNodeType": "Webhook",
+      "flowNodePosition": {
+        "posX": "2794",
+        "posY": "-508"
+      },
+      "isStartNode": false
+    },
+    {
+      "flowReplies": [
+        {
+          "flowReplyType": "Text",
+          "data": "<p>When are you thinking of visiting? Share a day and time.</p>",
+          "caption": "",
+          "mimeType": ""
+        }
+      ],
+      "userInputVariable": "visit_time",
+      "answerValidation": {
+        "type": "None",
+        "minValue": "",
+        "maxValue": "",
+        "regex": "",
+        "fallback": "I'm afraid I didn't understand, could you try again, please?",
+        "failsCount": "3"
+      },
+      "isMediaAccepted": false,
+      "expectedAnswers": null,
+      "id": "main_question-McYWk",
+      "flowNodeType": "Question",
+      "flowNodePosition": {
+        "posX": "3675",
+        "posY": "-923"
+      },
+      "isStartNode": false
+    },
+    {
+      "flowReplies": [
+        {
+          "flowReplyType": "Text",
+          "data": "<p>Hi, Welcome to Indihomes 👋 .</p>\n<p>I'm Rachna, your property assistant.</p>\n<p>I'll help you discover verified properties based on your budget, preferred location, and lifestyle.</p>\n<p>It only takes about a minute to get personalized recommendations.</p>",
+          "caption": "",
+          "mimeType": ""
+        }
+      ],
+      "id": "main_message-OpXVv",
+      "flowNodeType": "Message",
+      "flowNodePosition": {
+        "posX": "-965",
+        "posY": "-587"
+      },
+      "isStartNode": true
+    },
+    {
+      "interactiveButtonsHeader": {
+        "type": "Text",
+        "text": "",
+        "media": null
+      },
+      "interactiveButtonsBody": "<p>No worries at all! 😊</p>\n<p>Finding the right home is an important decision, and it's perfectly okay to take your time.</p>\n<p>We'll keep your preferences on record, and one of our property experts can reach out whenever you're ready.</p>\n<p>If you have any questions in the meantime, just send us a message—we're always here to help.Ask a question here</p>",
+      "interactiveButtonsFooter": "",
+      "interactiveButtonsItems": [
+        {
+          "id": "zSirEip",
+          "buttonText": "Schedule a Follow Up",
+          "nodeResultId": "main_message-DsQDE"
+        }
+      ],
+      "interactiveButtonsUserInputVariable": "",
+      "interactiveButtonsDefaultNodeResultId": "",
+      "id": "main_buttons-wFpLC",
+      "flowNodeType": "InteractiveButtons",
+      "flowNodePosition": {
+        "posX": "3834",
+        "posY": "-226"
+      },
+      "isStartNode": false
+    },
+    {
+      "flowReplies": [
+        {
+          "flowReplyType": "Text",
+          "data": "<p>Great. Our team will get back to you within 48 hours</p>",
+          "caption": "",
+          "mimeType": ""
+        }
+      ],
+      "id": "main_message-DsQDE",
+      "flowNodeType": "Message",
+      "flowNodePosition": {
+        "posX": "4311",
+        "posY": "-92"
+      },
+      "isStartNode": false
+    }
+  ],
+  "flowEdges": [
+    {
+      "id": "reactflow__edge-main_buttons-consent__btn_yes-main_buttons-city",
+      "sourceNodeId": "main_buttons-consent__btn_yes",
+      "targetNodeId": "main_buttons-city"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-consent__btn_later-main_message-later",
+      "sourceNodeId": "main_buttons-consent__btn_later",
+      "targetNodeId": "main_message-later"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-config__cfg_1-main_buttons-budget",
+      "sourceNodeId": "main_buttons-config__cfg_1",
+      "targetNodeId": "main_buttons-budget"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-config__cfg_2-main_buttons-budget",
+      "sourceNodeId": "main_buttons-config__cfg_2",
+      "targetNodeId": "main_buttons-budget"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-config__cfg_3-main_buttons-budget",
+      "sourceNodeId": "main_buttons-config__cfg_3",
+      "targetNodeId": "main_buttons-budget"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-budget__bud_1-main_buttons-flex",
+      "sourceNodeId": "main_buttons-budget__bud_1",
+      "targetNodeId": "main_buttons-flex"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-budget__bud_2-main_buttons-flex",
+      "sourceNodeId": "main_buttons-budget__bud_2",
+      "targetNodeId": "main_buttons-flex"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-budget__bud_3-main_buttons-flex",
+      "sourceNodeId": "main_buttons-budget__bud_3",
+      "targetNodeId": "main_buttons-flex"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-flex__flex_fixed-main_buttons-purpose",
+      "sourceNodeId": "main_buttons-flex__flex_fixed",
+      "targetNodeId": "main_buttons-purpose"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-flex__flex_flex-main_buttons-purpose",
+      "sourceNodeId": "main_buttons-flex__flex_flex",
+      "targetNodeId": "main_buttons-purpose"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-purpose__pur_self-main_buttons-priority",
+      "sourceNodeId": "main_buttons-purpose__pur_self",
+      "targetNodeId": "main_buttons-priority"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-purpose__pur_inv-main_buttons-priority",
+      "sourceNodeId": "main_buttons-purpose__pur_inv",
+      "targetNodeId": "main_buttons-priority"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-priority__pri_poss-main_buttons-possession",
+      "sourceNodeId": "main_buttons-priority__pri_poss",
+      "targetNodeId": "main_buttons-possession"
+    },
+    {
+      "id": "reactflow__edge-main_message-recommend-main_buttons-next",
+      "sourceNodeId": "main_message-recommend",
+      "targetNodeId": "main_buttons-next"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-next__nxt_advisor-main_message-advisor",
+      "sourceNodeId": "main_buttons-next__nxt_advisor",
+      "targetNodeId": "main_message-advisor"
+    },
+    {
+      "id": "reactflow__edge-main_message-visitconfirm-main_message-close",
+      "sourceNodeId": "main_message-visitconfirm",
+      "targetNodeId": "main_message-close"
+    },
+    {
+      "id": "reactflow__edge-main_message-advisor-main_message-close",
+      "sourceNodeId": "main_message-advisor",
+      "targetNodeId": "main_message-close"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-city__loc_more-main_question-wYPyQ",
+      "sourceNodeId": "main_buttons-city__loc_more",
+      "targetNodeId": "main_question-wYPyQ"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-priority__pri_amen-main_question-jzbHS",
+      "sourceNodeId": "main_buttons-priority__pri_amen",
+      "targetNodeId": "main_question-jzbHS"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-priority__pri_build-main_question-GLNoN",
+      "sourceNodeId": "main_buttons-priority__pri_build",
+      "targetNodeId": "main_question-GLNoN"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-possession__pos_ready-main_webhook-dcBeI",
+      "sourceNodeId": "main_buttons-possession__pos_ready",
+      "targetNodeId": "main_webhook-dcBeI"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-possession__pos_near-main_webhook-dcBeI",
+      "sourceNodeId": "main_buttons-possession__pos_near",
+      "targetNodeId": "main_webhook-dcBeI"
+    },
+    {
+      "id": "reactflow__edge-main_question-jzbHS-main_webhook-dcBeI",
+      "sourceNodeId": "main_question-jzbHS",
+      "targetNodeId": "main_webhook-dcBeI"
+    },
+    {
+      "id": "reactflow__edge-main_question-GLNoN-main_webhook-dcBeI",
+      "sourceNodeId": "main_question-GLNoN",
+      "targetNodeId": "main_webhook-dcBeI"
+    },
+    {
+      "id": "reactflow__edge-main_webhook-dcBeI-main_message-recommend",
+      "sourceNodeId": "main_webhook-dcBeI",
+      "targetNodeId": "main_message-recommend"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-next__nxt_visit-main_question-McYWk",
+      "sourceNodeId": "main_buttons-next__nxt_visit",
+      "targetNodeId": "main_question-McYWk"
+    },
+    {
+      "id": "reactflow__edge-main_question-McYWk-main_message-visitconfirm",
+      "sourceNodeId": "main_question-McYWk",
+      "targetNodeId": "main_message-visitconfirm"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-possession__MmNhHfj-main_webhook-dcBeI",
+      "sourceNodeId": "main_buttons-possession__MmNhHfj",
+      "targetNodeId": "main_webhook-dcBeI"
+    },
+    {
+      "id": "reactflow__edge-main_message-OpXVv-main_buttons-consent",
+      "sourceNodeId": "main_message-OpXVv",
+      "targetNodeId": "main_buttons-consent"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-next__nxt_loan-main_buttons-wFpLC",
+      "sourceNodeId": "main_buttons-next__nxt_loan",
+      "targetNodeId": "main_buttons-wFpLC"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-wFpLC__zSirEip-main_message-DsQDE",
+      "sourceNodeId": "main_buttons-wFpLC__zSirEip",
+      "targetNodeId": "main_message-DsQDE"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-city__loc_gore-main_buttons-config",
+      "sourceNodeId": "main_buttons-city__loc_gore",
+      "targetNodeId": "main_buttons-config"
+    },
+    {
+      "id": "reactflow__edge-main_buttons-city__loc_malad-main_buttons-config",
+      "sourceNodeId": "main_buttons-city__loc_malad",
+      "targetNodeId": "main_buttons-config"
+    },
+    {
+      "id": "reactflow__edge-main_question-wYPyQ-main_buttons-config",
+      "sourceNodeId": "main_question-wYPyQ",
+      "targetNodeId": "main_buttons-config"
+    }
+  ],
+  "lastUpdated": "2026-07-22T06:27:06.202Z",
+  "isDeleted": false,
+  "transform": {
+    "posX": "-133.27492698832998",
+    "posY": "983.5940548046369",
+    "zoom": "0.6597539553864482"
+  },
+  "isPro": true,
+  "flowVersion": 0,
+  "channelTypes": [
+    "WA"
+  ]
+}

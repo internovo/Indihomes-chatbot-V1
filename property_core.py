@@ -46,12 +46,14 @@ def norm_config(text: str) -> str:
 
 
 def friendly_name(nearby: str, area_label: str) -> str:
+    """Headline for a project. Keeps the suburb prominent; the micro-location
+    line underneath carries the landmark detail so we don't repeat ourselves."""
     nearby = (nearby or "").strip()
     area = (area_label or "").strip()
     if nearby and area:
-        return f"A residence near {nearby}, {area}"
+        return f"A residence in {nearby}, {area}"
     if nearby:
-        return f"A residence near {nearby}"
+        return f"A residence in {nearby}"
     if area:
         return f"A residence in {area}"
     return "An Indihomes residence"
@@ -67,6 +69,7 @@ for r in RAW:
         "location_label": (loc.get("label") or "").strip(),
         "location_value": (loc.get("value") or "").strip().lower(),
         "nearby": r.get("nearbyLocality", ""),
+        "landmarks": r.get("landmarks") or r.get("nearbyLandmarks") or [],
         "price_cr": lakh_to_cr(price.get("value")),
         "configs": [c.lower().replace(" ", "") for c in (r.get("flatConfiguration") or [])],
         "configs_display": r.get("flatConfiguration") or [],
@@ -110,12 +113,30 @@ def possession_phrase(p) -> str:
     return f"Possession by {p['possession_raw']}"
 
 
+def micro_location(p) -> str:
+    """Landmark line, e.g. 'Near D-Mart, opposite Central Bank'.
+    Uses explicit landmarks from the data when present. If the inventory has no
+    landmark fields yet, this stays empty rather than repeating the area name."""
+    bits = []
+    for lm in (p.get("landmarks") or [])[:3]:
+        lm = (lm or "").strip()
+        if lm:
+            bits.append(lm)
+    if bits:
+        return "Near " + ", ".join(bits)
+    return ""
+
+
 def detail_line(p) -> str:
     cfgs = " / ".join(p["configs_display"]) if p["configs_display"] else ""
     price = f"{p['price_cr']} Cr" if p["price_cr"] else "Price on request"
     amen = ", ".join(p["amenities_display"][:3])
-    parts = [f"{cfgs}, starting {price}" if cfgs else f"Starting {price}",
-             possession_phrase(p)]
+    parts = []
+    micro = micro_location(p)
+    if micro:
+        parts.append(micro)
+    parts.append(f"{cfgs}, starting {price}" if cfgs else f"Starting {price}")
+    parts.append(possession_phrase(p))
     if amen:
         parts.append(f"Highlights: {amen}")
     return "\n".join(parts)
@@ -136,12 +157,22 @@ def search(location="", configuration="", budget="", amenities="", possession=""
     # location may be several localities separated by | or , (e.g. Malad East|Malad West)
     loc_terms = [t.strip() for t in re.split(r"[|,]", loc) if t.strip()]
 
+    DIRECTIONS = ("east", "west", "north", "south")
+
     def loc_ok(p):
         if not loc_terms:
             return True
+        lv = p["location_value"]
         for t in loc_terms:
+            # If the user specified a direction (e.g. "dahisar west"), match it
+            # EXACTLY - never widen to the other side of the same suburb.
+            if any(t.endswith(" " + dirn) for dirn in DIRECTIONS):
+                if t == lv or lv == t:
+                    return True
+                continue
+            # No direction given (e.g. "dahisar") -> match the whole suburb.
             area = t.split()[0] if t.split() else t
-            if t in p["location_value"] or p["location_value"] in t or area in p["location_value"]:
+            if t == lv or t in lv or lv in t or area in lv:
                 return True
         return False
 
