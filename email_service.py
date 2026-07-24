@@ -6,7 +6,9 @@ Sends every advisor the lead's full requirements when a site visit is booked.
 Transport, in priority order (first one configured wins):
   1. Resend     - HTTPS API,  set RESEND_API_KEY     (works on Railway/PaaS)
   2. SendGrid   - HTTPS API,  set SENDGRID_API_KEY   (works on Railway/PaaS)
-  3. Gmail SMTP - set SMTP_USER + SMTP_APP_PASSWORD  (LOCAL DEV ONLY)
+  3. Brevo      - HTTPS API,  set BREVO_API_KEY      (works on Railway/PaaS;
+                  single-sender verification by email link, no DNS needed)
+  4. Gmail SMTP - set SMTP_USER + SMTP_APP_PASSWORD  (LOCAL DEV ONLY)
 
 WHY THE HTTPS APIS: Railway - like most PaaS hosts - blocks outbound SMTP
 ports (25/465/587) to curb spam, so smtplib cannot reach smtp.gmail.com there
@@ -55,13 +57,17 @@ def _sendgrid_key() -> str:
     return os.environ.get("SENDGRID_API_KEY", "").strip()
 
 
+def _brevo_key() -> str:
+    return os.environ.get("BREVO_API_KEY", "").strip()
+
+
 def _smtp_ready() -> bool:
     return bool(os.environ.get("SMTP_USER") and os.environ.get("SMTP_APP_PASSWORD"))
 
 
 def is_configured() -> bool:
     """True if any transport is set up, so /health can report 'connected'."""
-    return bool(_resend_key() or _sendgrid_key() or _smtp_ready())
+    return bool(_resend_key() or _sendgrid_key() or _brevo_key() or _smtp_ready())
 
 
 def _from_email() -> str:
@@ -156,6 +162,19 @@ def _send_via_resend(advisors: List[str], cc: List[str], subject: str, body: str
     return _post_json("https://api.resend.com/emails", headers, payload)
 
 
+def _send_via_brevo(advisors: List[str], cc: List[str], subject: str, body: str) -> bool:
+    payload = {
+        "sender": {"email": _from_email(), "name": _from_name()},
+        "to": [{"email": a} for a in advisors],
+        "subject": subject,
+        "textContent": body,
+    }
+    if cc:
+        payload["cc"] = [{"email": c} for c in cc]
+    headers = {"api-key": _brevo_key(), "Content-Type": "application/json", "Accept": "application/json"}
+    return _post_json("https://api.brevo.com/v3/smtp/email", headers, payload)
+
+
 def _send_via_sendgrid(advisors: List[str], cc: List[str], subject: str, body: str) -> bool:
     personalization = {"to": [{"email": a} for a in advisors]}
     if cc:
@@ -221,4 +240,6 @@ def send_booking_notification(advisor_emails, lead: Dict) -> bool:
         return _send_via_resend(advisors, cc, subject, body)
     if _sendgrid_key():
         return _send_via_sendgrid(advisors, cc, subject, body)
+    if _brevo_key():
+        return _send_via_brevo(advisors, cc, subject, body)
     return _send_via_smtp(advisors, cc, subject, body)
