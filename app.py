@@ -30,6 +30,7 @@ from pydantic import BaseModel
 from typing import Optional
 
 from property_core import search, PROPERTIES, KNOWN_LOCALITIES
+from sanitize import sanitise
 from llm_location import (
     location as location_handler,
     location_debug as location_debug_handler,
@@ -42,16 +43,18 @@ from llm_location import (
 )
 import calendar_service
 import appointments_db
+import email_service
 
 app = FastAPI()
 
 
-def _clean_incoming(value: str) -> str:
-    """WATI sometimes sends an unsubstituted {{var}} placeholder. Treat as empty."""
-    v = (value or "").strip()
-    if v.startswith("{{") and v.endswith("}}"):
-        return ""
-    return v
+def _clean_incoming(value: str, max_len: int = 100) -> str:
+    """Every free-text field WATI sends passes through here before it
+    reaches search(), a CRM payload, or a calendar/email description.
+    Delegates to the shared sanitiser: strips control/zero-width characters,
+    collapses whitespace, caps length, and strips unresolved WATI
+    placeholders ({{var}}, @var) - e.g. an unsubstituted {{location}}."""
+    return sanitise(value, max_len)
 
 
 class SearchRequest(BaseModel):
@@ -158,11 +161,11 @@ class LeadRequest(BaseModel):
 @app.post("/api/property-search")
 def property_search(lead: LeadRequest):
     return search(
-        location=lead.location,
-        configuration=lead.configuration,
-        budget=lead.budget,
-        amenities=lead.amenities,
-        possession=lead.possession,
+        location=_clean_incoming(lead.location),
+        configuration=_clean_incoming(lead.configuration),
+        budget=_clean_incoming(lead.budget),
+        amenities=_clean_incoming(lead.amenities),
+        possession=_clean_incoming(lead.possession),
     )
 
 
@@ -171,6 +174,7 @@ class FlexLocationRequest(BaseModel):
     message: Optional[str] = ""
     location: Optional[str] = ""
     location_text: Optional[str] = ""
+    phone: Optional[str] = ""
 
     def best(self) -> str:
         for c in (self.location_text, self.message, self.location):
@@ -183,8 +187,13 @@ class FlexLocationRequest(BaseModel):
 @app.post("/location")
 def location(req: FlexLocationRequest):
     """Location understanding only. Returns needs_clarification yes/no,
-    a clarify_question, and normalized_location."""
-    return location_handler(LocationRequest(message=req.best()))
+    a clarify_question, and normalized_location. phone (if sent) keys the
+    retry counter so repeated failed attempts escalate to a handoff instead
+    of looping the customer forever."""
+    return location_handler(LocationRequest(
+        message=req.best(),
+        phone=_clean_incoming(req.phone, 32),
+    ))
 
 
 @app.post("/debug-location")
@@ -227,7 +236,7 @@ class AvailableSlotsRequest(BaseModel):
 def available_slots(req: AvailableSlotsRequest):
     """Shows the customer real free slots from the shared calendar, and
     remembers them (keyed on phone) so /book-slot can resolve their reply."""
-    phone = _clean_incoming(req.phone)
+    phone = _clean_incoming(req.phone, 32)
     appt_type = _clean_incoming(req.appt_type) or "site_visit"
 
     if not phone:
@@ -266,17 +275,23 @@ class BookSlotRequest(BaseModel):
     name: Optional[str] = ""
     appt_type: Optional[str] = "site_visit"
     property_ref: Optional[str] = ""
+    # Lead requirements, forwarded from the WATI flow so the advisor's email
+    # carries the full picture, not just a name and a slot. All optional - if
+    # the flow doesn't send them, the email simply omits those lines.
+    budget: Optional[str] = ""
+    configuration: Optional[str] = ""
+    location: Optional[str] = ""
 
 
 @app.post("/book-slot")
 def book_slot(req: BookSlotRequest):
     """Resolves the customer's numbered reply against the slots we showed
     them, books the calendar event, and stores the appointment."""
-    phone = _clean_incoming(req.phone)
-    choice = _clean_incoming(req.choice)
+    phone = _clean_incoming(req.phone, 32)
+    choice = _clean_incoming(req.choice, 20)
     name = _clean_incoming(req.name)
     appt_type = _clean_incoming(req.appt_type) or "site_visit"
-    property_ref = _clean_incoming(req.property_ref)
+    property_ref = _clean_incoming(req.property_ref, 200)
 
     fallback_message = "One of our advisors will call you shortly to arrange a time."
 
@@ -337,6 +352,23 @@ def book_slot(req: BookSlotRequest):
     )
     appointments_db.clear_pending_slots(phone)
 
+    # Notify ALL advisors by email with the lead's full requirements.
+    # Best-effort only: the booking is already confirmed (calendar event +
+    # stored appointment), so a failed email must never change the result we
+    # return to WATI. email_service logs and returns False on any problem.
+    # (advisor_email above is still the round-robin pick used for the calendar
+    # event and the stored record; the email just goes to everyone.)
+    email_service.send_booking_notification(advisors, {
+        "name": name,
+        "phone": phone,
+        "slot_label": slot["label"],
+        "appt_type": appt_type,
+        "budget": _clean_incoming(req.budget),
+        "configuration": _clean_incoming(req.configuration),
+        "location": _clean_incoming(req.location),
+        "property_ref": property_ref,
+    })
+
     advisor_name = _advisor_display_name(advisor_email)
     return {
         "booked": "yes",
@@ -351,11 +383,13 @@ def health():
     groq = os.environ.get("GROQ_API_KEY") or ""
     llm = ("groq: loaded (ends ..." + groq[-4:] + "), model=" + GROQ_MODEL) if groq else "NO KEY LOADED"
     calendar_status = "connected" if calendar_service.is_configured() else "NOT CONFIGURED"
+    email_status = "connected" if email_service.is_configured() else "NOT CONFIGURED"
     return {
         "status": "ok",
         "properties_loaded": len(PROPERTIES),
         "known_localities": KNOWN_LOCALITIES,
         "llm": llm,
         "calendar": calendar_status,
+        "email": email_status,
         "advisors_loaded": len(calendar_service.advisor_emails()),
     }

@@ -15,7 +15,15 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(HERE, "appointments.db")
+# In production (e.g. Railway) the container filesystem is wiped on every
+# redeploy, so the DB must live on a mounted persistent volume. Point
+# APPOINTMENTS_DB_PATH at a file on that volume (e.g. /data/appointments.db).
+# Locally, with the env var unset, it falls back to the project folder.
+DB_PATH = os.environ.get("APPOINTMENTS_DB_PATH") or os.path.join(HERE, "appointments.db")
+# Make sure the parent directory exists (the volume mount may be empty).
+_db_dir = os.path.dirname(DB_PATH)
+if _db_dir:
+    os.makedirs(_db_dir, exist_ok=True)
 
 
 def _connect():

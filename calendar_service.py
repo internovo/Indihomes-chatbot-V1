@@ -19,6 +19,7 @@ unreachable, callers get an empty list / None back instead of an exception,
 so app.py can fall back to "an advisor will call" instead of a 500.
 """
 
+import json
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
@@ -58,24 +59,56 @@ def _calendar_id() -> str:
     return os.environ.get("GOOGLE_CALENDAR_ID", "")
 
 
+def _key_file_path() -> str:
+    """Absolute path to the service-account key file, if one is configured."""
+    key_file = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", "")
+    if not key_file:
+        return ""
+    return key_file if os.path.isabs(key_file) else os.path.join(HERE, key_file)
+
+
+def _load_credentials():
+    """Build service-account credentials from whichever source is available.
+
+    Prefers GOOGLE_SERVICE_ACCOUNT_JSON (the full key JSON pasted into an env
+    var) - this is how we ship creds to hosts like Railway where the .json
+    file isn't committed to the repo. Falls back to the on-disk key file for
+    local development. Returns None (never raises) if neither works."""
+    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if raw:
+        try:
+            info = json.loads(raw)
+            return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+        except Exception:
+            return None
+    path = _key_file_path()
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        return service_account.Credentials.from_service_account_file(path, scopes=SCOPES)
+    except Exception:
+        return None
+
+
 def is_configured() -> bool:
     """Whether we have enough env/creds to even try talking to Google."""
-    cal_id = _calendar_id()
-    key_file = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", "")
-    if not cal_id or not key_file:
+    if not _calendar_id():
         return False
-    path = key_file if os.path.isabs(key_file) else os.path.join(HERE, key_file)
-    return os.path.isfile(path)
+    # Either inline JSON creds (hosted) or a real key file on disk (local).
+    if os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip():
+        return True
+    path = _key_file_path()
+    return bool(path) and os.path.isfile(path)
 
 
 def _service():
     """Builds an authenticated Calendar API client, or None if unavailable."""
     if not is_configured():
         return None
-    key_file = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", "")
-    path = key_file if os.path.isabs(key_file) else os.path.join(HERE, key_file)
+    creds = _load_credentials()
+    if not creds:
+        return None
     try:
-        creds = service_account.Credentials.from_service_account_file(path, scopes=SCOPES)
         return build("calendar", "v3", credentials=creds, cache_discovery=False)
     except Exception:
         return None
