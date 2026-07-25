@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 /service_account.json
 appointments.db
+
+/DEPLOY.md
+/claude.md

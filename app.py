@@ -30,7 +30,6 @@ from pydantic import BaseModel
 from typing import Optional
 
 from property_core import search, PROPERTIES, KNOWN_LOCALITIES
-from sanitize import sanitise
 from llm_location import (
     location as location_handler,
     location_debug as location_debug_handler,
@@ -44,17 +43,17 @@ from llm_location import (
 import calendar_service
 import appointments_db
 import email_service
+import crm_service
 
 app = FastAPI()
 
 
-def _clean_incoming(value: str, max_len: int = 100) -> str:
-    """Every free-text field WATI sends passes through here before it
-    reaches search(), a CRM payload, or a calendar/email description.
-    Delegates to the shared sanitiser: strips control/zero-width characters,
-    collapses whitespace, caps length, and strips unresolved WATI
-    placeholders ({{var}}, @var) - e.g. an unsubstituted {{location}}."""
-    return sanitise(value, max_len)
+def _clean_incoming(value: str) -> str:
+    """WATI sometimes sends an unsubstituted {{var}} placeholder. Treat as empty."""
+    v = (value or "").strip()
+    if v.startswith("{{") and v.endswith("}}"):
+        return ""
+    return v
 
 
 class SearchRequest(BaseModel):
@@ -161,11 +160,11 @@ class LeadRequest(BaseModel):
 @app.post("/api/property-search")
 def property_search(lead: LeadRequest):
     return search(
-        location=_clean_incoming(lead.location),
-        configuration=_clean_incoming(lead.configuration),
-        budget=_clean_incoming(lead.budget),
-        amenities=_clean_incoming(lead.amenities),
-        possession=_clean_incoming(lead.possession),
+        location=lead.location,
+        configuration=lead.configuration,
+        budget=lead.budget,
+        amenities=lead.amenities,
+        possession=lead.possession,
     )
 
 
@@ -174,7 +173,6 @@ class FlexLocationRequest(BaseModel):
     message: Optional[str] = ""
     location: Optional[str] = ""
     location_text: Optional[str] = ""
-    phone: Optional[str] = ""
 
     def best(self) -> str:
         for c in (self.location_text, self.message, self.location):
@@ -187,13 +185,8 @@ class FlexLocationRequest(BaseModel):
 @app.post("/location")
 def location(req: FlexLocationRequest):
     """Location understanding only. Returns needs_clarification yes/no,
-    a clarify_question, and normalized_location. phone (if sent) keys the
-    retry counter so repeated failed attempts escalate to a handoff instead
-    of looping the customer forever."""
-    return location_handler(LocationRequest(
-        message=req.best(),
-        phone=_clean_incoming(req.phone, 32),
-    ))
+    a clarify_question, and normalized_location."""
+    return location_handler(LocationRequest(message=req.best()))
 
 
 @app.post("/debug-location")
@@ -236,7 +229,7 @@ class AvailableSlotsRequest(BaseModel):
 def available_slots(req: AvailableSlotsRequest):
     """Shows the customer real free slots from the shared calendar, and
     remembers them (keyed on phone) so /book-slot can resolve their reply."""
-    phone = _clean_incoming(req.phone, 32)
+    phone = _clean_incoming(req.phone)
     appt_type = _clean_incoming(req.appt_type) or "site_visit"
 
     if not phone:
@@ -287,11 +280,11 @@ class BookSlotRequest(BaseModel):
 def book_slot(req: BookSlotRequest):
     """Resolves the customer's numbered reply against the slots we showed
     them, books the calendar event, and stores the appointment."""
-    phone = _clean_incoming(req.phone, 32)
-    choice = _clean_incoming(req.choice, 20)
+    phone = _clean_incoming(req.phone)
+    choice = _clean_incoming(req.choice)
     name = _clean_incoming(req.name)
     appt_type = _clean_incoming(req.appt_type) or "site_visit"
-    property_ref = _clean_incoming(req.property_ref, 200)
+    property_ref = _clean_incoming(req.property_ref)
 
     fallback_message = "One of our advisors will call you shortly to arrange a time."
 
@@ -375,6 +368,91 @@ def book_slot(req: BookSlotRequest):
         "message": f"Appointment confirmed for {slot['label']}. Our Advisor from Indihomes will Contact you.",
         "advisor": advisor_name,
         "slot_label": slot["label"],
+    }
+
+
+# --------------------------------------------------------------------------
+# CRM: save the lead at the END of the conversation (one call per lead).
+# The `outcome` WATI sends decides the status we record.
+# --------------------------------------------------------------------------
+OUTCOME_STATUS = {
+    "site_visit_scheduled": ("Interested", "Site Visit Scheduled"),
+    "details_shared":       ("Interested", "Details Shared"),
+    "not_interested":       ("Not Interested", ""),
+    "wip":                  ("WIP", ""),
+}
+
+
+class SaveLeadRequest(BaseModel):
+    phone: Optional[str] = ""
+    name: Optional[str] = ""
+    location: Optional[str] = ""
+    budget: Optional[str] = ""
+    configuration: Optional[str] = ""
+    possession_pref: Optional[str] = ""
+    purpose: Optional[str] = ""
+    amenities: Optional[str] = ""
+    project_code: Optional[str] = ""      # e.g. @code1 from /search, or the picked one
+    recommendations: Optional[str] = ""   # the shortlist text we showed
+    outcome: Optional[str] = "details_shared"
+
+
+@app.post("/save-lead")
+def save_lead(req: SaveLeadRequest):
+    """Push the finished conversation to the CRM via createLead. Safe by default:
+    crm_service runs in DRY-RUN (logs the payload, writes nothing) until
+    CRM_DRY_RUN=false. Never returns a 500 to WATI."""
+    phone = _clean_incoming(req.phone)
+    if not phone:
+        return {"saved": "no", "message": "No phone on record.", "dry_run": "yes"}
+
+    outcome = (_clean_incoming(req.outcome) or "details_shared").lower()
+    main_status, sub_status = OUTCOME_STATUS.get(outcome, ("Interested", "Details Shared"))
+
+    purpose = _clean_incoming(req.purpose).lower()
+    user_type = "Investor" if "invest" in purpose else ("Buyer" if purpose else "")
+
+    # All the human context goes into notes (createLead's free-text field the
+    # calling team reads). Status is recorded here too until we confirm whether
+    # createLead accepts a status field / has an update endpoint.
+    status_line = f"Status: {main_status}" + (f" / {sub_status}" if sub_status else "")
+    note_bits = [status_line]
+    if _clean_incoming(req.location):
+        note_bits.append(f"Preferred area: {_clean_incoming(req.location)}")
+    if _clean_incoming(req.budget):
+        note_bits.append(f"Budget: {_clean_incoming(req.budget)}")
+    if _clean_incoming(req.configuration):
+        note_bits.append(f"Configuration: {_clean_incoming(req.configuration)}")
+    if _clean_incoming(req.possession_pref):
+        note_bits.append(f"Possession: {_clean_incoming(req.possession_pref)}")
+    if _clean_incoming(req.purpose):
+        note_bits.append(f"Purpose: {_clean_incoming(req.purpose)}")
+    if _clean_incoming(req.amenities):
+        note_bits.append(f"Amenities wanted: {_clean_incoming(req.amenities)}")
+    if _clean_incoming(req.recommendations):
+        note_bits.append("Shortlist shown:\n" + _clean_incoming(req.recommendations))
+    notes = "\n".join(note_bits)
+
+    result = crm_service.push_lead({
+        "name": _clean_incoming(req.name),
+        "phone": phone,
+        "email": "",  # not collected over WhatsApp
+        "configuration": _clean_incoming(req.configuration),
+        "project_code": _clean_incoming(req.project_code),
+        "target_possession": "",  # only a preference; kept in notes
+        "budget": _clean_incoming(req.budget),
+        "location": _clean_incoming(req.location),
+        "notes": notes,
+        "lead_source": "WhatsApp Bot",
+        "user_type": user_type,
+    })
+
+    return {
+        "saved": "yes" if result.get("ok") else "no",
+        "message": "Your details are noted; our team will be in touch."
+                   if result.get("ok") else
+                   "Our team will follow up with you shortly.",
+        "dry_run": "yes" if result.get("dry_run") else "no",
     }
 
 

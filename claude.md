@@ -176,8 +176,8 @@ Response:
 ```json
 {
   "booked": "yes",
-  "message": "Appointment confirmed for Thu 24 Jul, 2:00 PM. Rahul from Indihomes will meet you.",
-  "advisor": "Rahul Shah",
+  "message": "Appointment confirmed for Thu 24 Jul, 2:00 PM. Arpit from Indihomes will meet you.",
+  "advisor": "Arpit ",
   "slot_label": "Thu 24 Jul, 2:00 PM"
 }
 ```
