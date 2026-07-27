@@ -56,6 +56,13 @@ def init_db():
               created_at TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS shown_properties (
+              lead_phone TEXT PRIMARY KEY,
+              items_json TEXT,
+              created_at TEXT
+            )
+        """)
         conn.commit()
     finally:
         conn.close()
@@ -98,6 +105,37 @@ def clear_pending_slots(phone: str):
     try:
         conn.execute("DELETE FROM pending_slots WHERE lead_phone = ?", (phone,))
         conn.commit()
+    finally:
+        conn.close()
+
+
+def save_shortlist(phone: str, items: List[Dict]):
+    """Remember the numbered property list we showed this phone, so
+    /property-detail can resolve a reply of '3' to a specific project."""
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT INTO shown_properties (lead_phone, items_json, created_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(lead_phone) DO UPDATE SET items_json=excluded.items_json, created_at=excluded.created_at",
+            (phone, json.dumps(items), datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_shortlist(phone: str) -> List[Dict]:
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT items_json FROM shown_properties WHERE lead_phone = ?", (phone,)
+        ).fetchone()
+        if not row:
+            return []
+        try:
+            return json.loads(row["items_json"])
+        except (TypeError, ValueError):
+            return []
     finally:
         conn.close()
 

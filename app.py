@@ -58,6 +58,7 @@ def _clean_incoming(value: str) -> str:
 
 class SearchRequest(BaseModel):
     """Everything the chatbot collected, sent in one go."""
+    phone: Optional[str] = ""   # needed so we can remember the shortlist per phone
     # location may arrive as free text (from the open question) and/or as a
     # button value. We accept several names so the flow can send whatever it has.
     message: Optional[str] = ""
@@ -88,7 +89,7 @@ class SearchRequest(BaseModel):
         return _clean_incoming(self.builder) or _clean_incoming(self.builder_pref)
 
 
-def run_pipeline(req: SearchRequest):
+def run_pipeline(req: SearchRequest, limit: int = 5):
     """Location understanding + property search, in one pass."""
     raw_location = req.best_location()
 
@@ -118,6 +119,7 @@ def run_pipeline(req: SearchRequest):
         budget=_clean_incoming(req.budget),
         amenities=_clean_incoming(req.amenities),
         possession=req.best_possession(),
+        limit=limit,
     )
 
     if llm_note and result.get("count"):
@@ -129,9 +131,48 @@ def run_pipeline(req: SearchRequest):
 
 @app.post("/search")
 def one_call_search(req: SearchRequest):
-    """THE endpoint the chatbot should call at the end of the conversation."""
-    result, _ = run_pipeline(req)
+    """THE endpoint the chatbot should call at the end of the conversation.
+    Now returns up to 5 numbered results and remembers the shortlist (keyed on
+    phone) so /property-detail can resolve the number the user replies with."""
+    result, _ = run_pipeline(req, limit=5)
+    phone = _clean_incoming(req.phone)
+    if phone and result.get("shortlist"):
+        try:
+            appointments_db.save_shortlist(phone, result["shortlist"])
+        except Exception as e:
+            print(f"[app] could not save shortlist: {e}")
     return result
+
+
+class PropertyDetailRequest(BaseModel):
+    phone: Optional[str] = ""
+    choice: Optional[str] = ""   # the number the user replied with
+
+
+@app.post("/property-detail")
+def property_detail(req: PropertyDetailRequest):
+    """Resolve the number the user picked against the shortlist we showed them,
+    and return that project's full detail block + image URL for WATI to send."""
+    phone = _clean_incoming(req.phone)
+    choice = _clean_incoming(req.choice)
+
+    items = appointments_db.get_shortlist(phone) if phone else []
+    if not items:
+        return {"found": "no", "name": "", "image_url": "",
+                "detail": "That list has expired. Please tell me your requirements again to see fresh options."}
+
+    idx = _parse_choice(choice, len(items))
+    if idx is None:
+        return {"found": "no", "name": "", "image_url": "",
+                "detail": f"Please reply with a number between 1 and {len(items)} to see that property."}
+
+    item = items[idx - 1]
+    return {
+        "found": "yes",
+        "name": item.get("name", ""),
+        "detail": item.get("detail", ""),
+        "image_url": item.get("image", ""),
+    }
 
 
 @app.post("/debug-search")

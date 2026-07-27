@@ -268,6 +268,39 @@ def detail_line(p) -> str:
     return "\n".join(parts)
 
 
+def format_detail(p) -> str:
+    """Rich single-property block built ONLY from live API fields (no bespoke
+    marketing copy). Shown when the user picks a property number in Phase 3."""
+    lines = [f"🏙️ *{p.get('display_name') or p['name']}*"]
+    loc = ", ".join(x for x in [(p.get("nearby") or "").strip(), p.get("location_label", "")] if x)
+    if loc:
+        lines.append(f"📍 {loc}")
+    desc = (p.get("description") or "").strip()
+    if desc:
+        lines.append("")
+        lines.append(desc[:500].rstrip())
+    lines.append("")
+    cfgs = " / ".join(p["configs_display"]) if p["configs_display"] else ""
+    if cfgs:
+        lines.append(f"🏠 Configurations: {cfgs}")
+    carpet = p.get("carpet") or {}
+    cmin, cmax = carpet.get("min"), carpet.get("max")
+    unit = carpet.get("unit", "Sq. Ft.")
+    if cmin and cmax:
+        lines.append(f"📐 Carpet: {int(cmin)}–{int(cmax)} {unit}")
+    elif cmin or cmax:
+        lines.append(f"📐 Carpet: {int(cmin or cmax)} {unit}")
+    if p["price_cr"]:
+        lines.append(f"💰 Starting {p['price_cr']} Cr")
+    lines.append(f"🗓️ {possession_phrase(p)}")
+    if p.get("project_status"):
+        lines.append(f"🏗️ {p['project_status']}")
+    amen = ", ".join(p["amenities_display"][:6])
+    if amen:
+        lines.append(f"✨ Highlights: {amen}")
+    return "\n".join(lines)
+
+
 def search(location="", configuration="", budget="", amenities="", possession="", limit=3, **_) -> Dict:
     """The one property search. Now returns up to `limit` results (default 3;
     pass 5 for the new pick-a-property flow). Filtering stays local Python over
@@ -336,7 +369,7 @@ def search(location="", configuration="", budget="", amenities="", possession=""
     elif not top:
         top = PROPERTIES[:limit]
 
-    blocks = [f"{p['name']}\n{detail_line(p)}" for p in top]
+    blocks = [f"{i + 1}. {p['name']}\n{detail_line(p)}" for i, p in enumerate(top)]
     recommendations = "\n\n".join(blocks) if blocks else \
         "No exact matches yet, but our advisor will shortlist options for you."
     if note:
@@ -349,9 +382,13 @@ def search(location="", configuration="", budget="", amenities="", possession=""
         "min_price": f"{min(prices):.2f} Cr" if prices else "",
         "max_price": f"{max(prices):.2f} Cr" if prices else "",
         "count": len(top),
-        # machine-readable shortlist for the pick-a-property flow (Phase 3):
+        # machine-readable shortlist for the pick-a-property flow (Phase 3).
+        # Includes the rich detail + image so /property-detail needs no 2nd API call.
         "shortlist": [{"index": i + 1, "id": p["id"], "code": p["code"],
-                       "name": p["name"], "label": p["location_label"]} for i, p in enumerate(top)],
+                       "name": p["name"], "label": p["location_label"],
+                       "detail": format_detail(p),
+                       "image": (p["media_urls"][0] if p["media_urls"] else p["brochure_url"])}
+                      for i, p in enumerate(top)],
     }
     for i in range(max(3, limit)):
         idx = i + 1
