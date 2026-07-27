@@ -5,11 +5,6 @@ DATA SOURCE (changed): inventory now comes from the LIVE Indihomes API
 (property_api.py) instead of the frozen properties.json. properties.json is kept
 as an OFFLINE FALLBACK so the bot never dies if the API is briefly unreachable.
 
-Exposes (unchanged interface, so app.py / llm_location.py don't change):
-  - PROPERTIES        : normalized records (list, refreshed in place)
-  - KNOWN_LOCALITIES  : real locality labels (for LLM validation)
-  - KNOWN_LOCALITIES_LOWER : lower->proper map
-  - search()          : the property search used at the end of the flow
 
 The normalization maps the live API record into exactly the internal shape
 search() already expects, so the search logic and the WATI flow stay identical.
@@ -34,7 +29,7 @@ DATA_PATH = os.path.join(HERE, "properties.json")
 
 
 # --------------------------------------------------------------------------
-# small helpers (unchanged)
+# small helpers 
 # --------------------------------------------------------------------------
 def lakh_to_cr(value) -> float:
     try:
@@ -145,7 +140,7 @@ def _normalize(r: Dict) -> Dict:
 
 
 # --------------------------------------------------------------------------
-# inventory load / refresh (populate module globals IN PLACE so imports stay valid)
+# inventory load 
 # --------------------------------------------------------------------------
 PROPERTIES: List[Dict] = []
 KNOWN_LOCALITIES: List[str] = []
@@ -213,7 +208,7 @@ if not PROPERTIES:
 
 
 # --------------------------------------------------------------------------
-# formatting + search (logic unchanged; now uses displayName via 'name')
+# formatting + search 
 # --------------------------------------------------------------------------
 def clean(val: str) -> str:
     v = (val or "").strip()
