@@ -138,7 +138,7 @@ def _normalize(r: Dict) -> Dict:
         "brochure_url": (r.get("brochure_url") or "").strip(),
         "media_urls": _normalize_media(r.get("media_urls")),
         "floor_urls": _normalize_media(r.get("floor_urls")),
-        "description": (r.get("description") or "").replace("\n", " ").strip(),
+        "description": (r.get("description") or "").strip(),  # keep newlines; cleaned at format time
         "project_status": (r.get("projectStatus") or "").strip(),
         "carpet": _normalize_carpet(r.get("carpetSize")),
     }
@@ -268,6 +268,70 @@ def detail_line(p) -> str:
     return "\n".join(parts)
 
 
+def _emph_to_whatsapp(s: str) -> str:
+    """Markdown emphasis -> WhatsApp. WhatsApp bold is a SINGLE '*', so both
+    '**bold**' and '*italic*' collapse to WhatsApp bold '*...*'. Also tidy spaces."""
+    s = s.replace("**", "*")               # '**bold**' -> '*bold*'
+    s = re.sub(r"[ \t]+", " ", s).strip()
+    return s
+
+
+def _intro_segment(raw: str) -> str:
+    """The lead of the description: the tagline + opening paragraph, i.e. the
+    text before the first structured section (Project Highlights / Carpet Area /
+    the first '---' rule / the second markdown heading). Everything after that
+    duplicates the emoji quick-facts block below, so we drop it to stay tidy."""
+    if not raw:
+        return ""
+    cut = len(raw)
+    # 2nd markdown heading (the 1st is the tagline we want to keep)
+    heads = [m.start() for m in re.finditer(r"(?m)^[ \t]*#{2,6}[ \t]+", raw)]
+    if len(heads) >= 2:
+        cut = min(cut, heads[1])
+    # first horizontal rule
+    m_rule = re.search(r"(?m)^[ \t]*-{3,}[ \t]*$", raw)
+    if m_rule:
+        cut = min(cut, m_rule.start())
+    # explicit section labels, in case headings/rules are absent
+    for label in ("Project Highlights", "Carpet Area", "Configuration:", "Structure:"):
+        i = raw.find(label)
+        if i != -1:
+            cut = min(cut, i)
+    return raw[:cut]
+
+
+def _clean_description(raw: str, limit: int = 550) -> str:
+    """Turn the API's raw markdown description into a tidy WhatsApp block:
+    headings become bold lines, '**' becomes WhatsApp bold, rules/extra blank
+    lines are dropped. Only the intro segment is kept (see _intro_segment)."""
+    seg = _intro_segment(raw)
+    if not seg:
+        return ""
+    out: List[str] = []
+    for ln in seg.replace("\r", "").split("\n"):
+        stripped = ln.strip()
+        if not stripped:
+            out.append("")
+            continue
+        if set(stripped) <= set("-–—*_ "):     # a rule / separator line
+            out.append("")
+            continue
+        h = re.match(r"^[ \t]*#{1,6}[ \t]*(.+?)[ \t]*$", ln)  # heading -> bold line
+        if h:
+            out.append(f"*{h.group(1).replace('**', '').replace('*', '').strip()}*")
+            continue
+        b = re.match(r"^[ \t]*[-*][ \t]+(.*)$", ln)          # bullet -> •
+        if b:
+            out.append(f"• {_emph_to_whatsapp(b.group(1))}")
+            continue
+        out.append(_emph_to_whatsapp(stripped))
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+    if len(text) > limit:                      # trim to a sentence boundary
+        c = text.rfind(". ", 0, limit)
+        text = text[:c + 1] if c > 120 else text[:limit].rstrip() + "…"
+    return text
+
+
 def format_detail(p) -> str:
     """Rich single-property block built ONLY from live API fields (no bespoke
     marketing copy). Shown when the user picks a property number in Phase 3."""
@@ -275,10 +339,10 @@ def format_detail(p) -> str:
     loc = ", ".join(x for x in [(p.get("nearby") or "").strip(), p.get("location_label", "")] if x)
     if loc:
         lines.append(f"📍 {loc}")
-    desc = (p.get("description") or "").strip()
+    desc = _clean_description(p.get("description") or "")
     if desc:
         lines.append("")
-        lines.append(desc[:500].rstrip())
+        lines.append(desc)
     lines.append("")
     cfgs = " / ".join(p["configs_display"]) if p["configs_display"] else ""
     if cfgs:
