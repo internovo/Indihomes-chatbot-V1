@@ -271,18 +271,98 @@ def property_url(p) -> str:
     return f"https://indihomes.co.in/properties/{code}" if code else ""
 
 
+# Section labels/markers that start the Cosmos description's structured part
+# (Configuration tables, carpet sizes, feature bullets). Everything from the
+# first one onward duplicates the emoji quick-facts block, so the intro
+# paragraph stops there. Matched as plain substrings (not line-anchored)
+# because descriptions aren't reliably newline-clean.
+_DESC_SECTION_MARKERS = ("Project Highlights", "Carpet Area", "Configuration:",
+                          "Structure:", "Key Features", "Amenities")
+
+
+def _intro_raw_segment(raw: str) -> str:
+    """The opening prose block of the description, before it drops into
+    markdown headings / --- rules / structured sections."""
+    cut = len(raw)
+    m = re.search(r"#{1,6}\s", raw)          # any heading, wherever it falls
+    if m:
+        cut = min(cut, m.start())
+    m = re.search(r"-{3,}", raw)             # horizontal rule
+    if m:
+        cut = min(cut, m.start())
+    for label in _DESC_SECTION_MARKERS:
+        i = raw.find(label)
+        if i != -1:
+            cut = min(cut, i)
+    return raw[:cut]
+
+
+def _strip_markdown(s: str) -> str:
+    """Drop markdown syntax the description may still contain, down to plain
+    prose. No headings/rules should remain by this point, but bold/italic
+    markers and bullets can still appear inline. ALL asterisks are stripped
+    (not just '**' pairs) - some raw descriptions have an unmatched lone '*',
+    and WhatsApp treats every '*' as a bold toggle, so a single leftover one
+    corrupts the rest of the message."""
+    s = s.replace("*", "")                            # bold/italic markers, matched or not
+    s = re.sub(r"(?m)^[ \t]*[•\-][ \t]+", "", s)       # bullets at a line start
+    s = s.replace("•", " ")                            # stray bullets mid-text
+    return re.sub(r"\s+", " ", s).strip()              # collapse whitespace/newlines
+
+
+def clean_description(raw: str, limit: int = 300) -> str:
+    """Short, clean intro paragraph for the detail message: strip all
+    markdown, keep only the opening prose (before any structured section),
+    then cap it at ~1-2 sentences / `limit` chars, cut at a sentence boundary
+    - never mid-sentence, never the whole field."""
+    if not raw:
+        return ""
+    text = _strip_markdown(_intro_raw_segment(raw))
+    if not text:
+        return ""
+    ends = [m.end() for m in re.finditer(r"[.!?](?:\s|$)", text)]
+    cut = 0
+    for i, e in enumerate(ends):
+        if i >= 2 or e > limit:
+            break
+        cut = e
+    if not cut:
+        cut = text.rfind(" ", 0, limit)
+        if cut <= 0:
+            cut = min(len(text), limit)
+    return text[:cut].strip()
+
+
+def _no_stars(s: str) -> str:
+    """Strip stray asterisks from any dynamic field before it goes into the
+    message. WhatsApp bold is a single '*' toggle - the ONLY two asterisks in
+    the whole message must be the ones we deliberately wrap displayName in,
+    or a rogue '*' from live data (e.g. in the name/description/amenities)
+    flips bold on and never turns it back off, corrupting everything after
+    it, including the URL line."""
+    return (s or "").replace("*", "")
+
+
 def format_detail(p) -> str:
-    """Rich single-property block built ONLY from live API structured fields -
-    no raw `description` (it's Cosmos markdown WhatsApp can't render). Shown
-    when the user picks a property number in Phase 3. Ends with the Indihomes
-    website link instead of a brochure/media image."""
-    lines = [f"\U0001F3D9️ *{p.get('display_name') or p['name']}*"]
-    loc = ", ".join(x for x in [(p.get("nearby") or "").strip(), p.get("location_label", "")] if x)
+    """Rich single-property block built from live API fields. The raw Cosmos
+    `description` is markdown WhatsApp can't render, so only a short cleaned
+    intro paragraph is kept (see clean_description); the rest of the block is
+    structured fields. Shown when the user picks a property number in Phase 3.
+    Ends with the Indihomes website link instead of a brochure/media image."""
+    name = _no_stars(p.get('display_name') or p['name'])
+    lines = [f"\U0001F3D9️ *{name}*"]
+    loc = ", ".join(x for x in [_no_stars((p.get("nearby") or "").strip()),
+                                 _no_stars(p.get("location_label", ""))] if x)
     if loc:
         lines.append(f"\U0001F4CD {loc}")
     lines.append("")
 
-    cfgs = " / ".join(p["configs_display"]) if p["configs_display"] else ""
+    intro = clean_description(p.get("description") or "")   # already asterisk-free (_strip_markdown)
+    if intro:
+        lines.append(intro)
+        lines.append("")
+
+    cfgs = " / ".join(_no_stars(c) for c in p["configs_display"]) if p["configs_display"] else ""
     if cfgs:
         lines.append(f"\U0001F3E0 Configurations: {cfgs}")
 
@@ -297,14 +377,14 @@ def format_detail(p) -> str:
     lines.append(f"\U0001F4B0 Starting {price}")
 
     if p.get("possession_raw"):
-        lines.append(f"\U0001F5D3️ Possession by {p['possession_raw']}")
+        lines.append(f"\U0001F5D3️ Possession by {_no_stars(p['possession_raw'])}")
     else:
         lines.append(f"\U0001F5D3️ {possession_phrase(p)}")
 
     if p.get("project_status"):
-        lines.append(f"\U0001F3D7️ {p['project_status']}")
+        lines.append(f"\U0001F3D7️ {_no_stars(p['project_status'])}")
 
-    amen = ", ".join(p["amenities_display"][:5])
+    amen = ", ".join(_no_stars(a) for a in p["amenities_display"][:5])
     if amen:
         lines.append(f"✨ Highlights: {amen}")
 
