@@ -393,10 +393,22 @@ def format_detail(p) -> str:
     body_lines[0] = body_lines[0].replace(clean_name, f"*{clean_name}*", 1)
     result = "\n".join(body_lines)
 
-    assert result.count("*") == 2, f"expected 2 asterisks, got {result.count('*')}"
-    assert result.rstrip()[-1] != "*", "message still ends with asterisk"
-    assert result.rstrip().endswith(code) or "properties/" in result.rstrip()[-60:], \
-        "message doesn't end with the project link"
+    # Self-check, not a crash: a WATI reply must never 500 out to the user, so
+    # if the guardrail above somehow still didn't leave exactly 2 asterisks
+    # (e.g. clean_name wasn't found verbatim on the first line), fix it in
+    # place and log which property triggered it, instead of raising.
+    if result.count("*") != 2 or result.rstrip().endswith("*"):
+        print(f"[property_core] format_detail: asterisk guardrail had to force-correct "
+              f"code={code!r} (got {result.count('*')} asterisks)")
+        result = result.replace("*", "")
+        body_lines = result.split("\n")
+        body_lines[0] = f"\U0001F3D9️ *{clean_name}*"
+        result = "\n".join(body_lines)
+
+    if url and not result.rstrip().endswith(code or url):
+        print(f"[property_core] format_detail: message didn't end with the link, "
+              f"appending it. code={code!r}")
+        result = result.rstrip() + "\n\n" + url
 
     return result
 
