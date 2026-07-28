@@ -323,36 +323,34 @@ def clean_description(raw: str, limit: int = 500) -> str:
     return text[:cut].strip()
 
 
-def _no_stars(s: str) -> str:
-    """Strip stray asterisks from any dynamic field before it goes into the
-    message. WhatsApp bold is a single '*' toggle - the ONLY two asterisks in
-    the whole message must be the ones we deliberately wrap displayName in,
-    or a rogue '*' from live data (e.g. in the name/description/amenities)
-    flips bold on and never turns it back off, corrupting everything after
-    it, including the URL line."""
-    return (s or "").replace("*", "")
-
-
 def format_detail(p) -> str:
     """Rich single-property block built from live API fields. The raw Cosmos
     `description` is markdown WhatsApp can't render, so only a short cleaned
     intro paragraph is kept (see clean_description); the rest of the block is
     structured fields. Shown when the user picks a property number in Phase 3.
-    Ends with the Indihomes website link instead of a brochure/media image."""
-    name = _no_stars(p.get('display_name') or p['name'])
-    lines = [f"\U0001F3D9️ *{name}*"]
-    loc = ", ".join(x for x in [_no_stars((p.get("nearby") or "").strip()),
-                                 _no_stars(p.get("location_label", ""))] if x)
+    Ends with the Indihomes website link instead of a brochure/media image.
+
+    Asterisks are handled with ONE final guardrail instead of scrubbing every
+    field individually: the message is assembled with the displayName in
+    plain text (no bold), then every '*' in the finished string is stripped -
+    wiping out any stray asterisk any Cosmos field might contain, wherever it
+    is - and only THEN is the displayName line re-wrapped in the two
+    intentional bold markers. That's the only place '*' can end up in the
+    output, so a rogue asterisk downstream (say, in the description or an
+    amenity) can never again leak onto the URL line."""
+    name = p.get('display_name') or p['name']
+    lines = [f"\U0001F3D9️ {name}"]
+    loc = ", ".join(x for x in [(p.get("nearby") or "").strip(), p.get("location_label", "")] if x)
     if loc:
         lines.append(f"\U0001F4CD {loc}")
     lines.append("")
 
-    intro = clean_description(p.get("description") or "")   # already asterisk-free (_strip_markdown)
+    intro = clean_description(p.get("description") or "")
     if intro:
         lines.append(intro)
         lines.append("")
 
-    cfgs = " / ".join(_no_stars(c) for c in p["configs_display"]) if p["configs_display"] else ""
+    cfgs = " / ".join(p["configs_display"]) if p["configs_display"] else ""
     if cfgs:
         lines.append(f"\U0001F3E0 Configurations: {cfgs}")
 
@@ -367,23 +365,40 @@ def format_detail(p) -> str:
     lines.append(f"\U0001F4B0 Starting {price}")
 
     if p.get("possession_raw"):
-        lines.append(f"\U0001F5D3️ Possession by {_no_stars(p['possession_raw'])}")
+        lines.append(f"\U0001F5D3️ Possession by {p['possession_raw']}")
     else:
         lines.append(f"\U0001F5D3️ {possession_phrase(p)}")
 
     if p.get("project_status"):
-        lines.append(f"\U0001F3D7️ {_no_stars(p['project_status'])}")
+        lines.append(f"\U0001F3D7️ {p['project_status']}")
 
-    amen = ", ".join(_no_stars(a) for a in p["amenities_display"][:5])
+    amen = ", ".join(p["amenities_display"][:5])
     if amen:
         lines.append(f"✨ Highlights: {amen}")
 
+    code = (p.get("code") or "").strip()
     url = property_url(p)
     if url:
         lines.append("")
         lines.append(url)
 
-    return "\n".join(lines)
+    message = "\n".join(lines)
+
+    # THE guardrail: zero every asterisk, then re-apply exactly two, on the
+    # displayName line only (a targeted replace on that one line, not a
+    # global one - the name could otherwise recur inside the description).
+    message = message.replace("*", "")
+    body_lines = message.split("\n")
+    clean_name = name.replace("*", "")
+    body_lines[0] = body_lines[0].replace(clean_name, f"*{clean_name}*", 1)
+    result = "\n".join(body_lines)
+
+    assert result.count("*") == 2, f"expected 2 asterisks, got {result.count('*')}"
+    assert result.rstrip()[-1] != "*", "message still ends with asterisk"
+    assert result.rstrip().endswith(code) or "properties/" in result.rstrip()[-60:], \
+        "message doesn't end with the project link"
+
+    return result
 
 
 def search(location="", configuration="", budget="", amenities="", possession="", limit=3, **_) -> Dict:
