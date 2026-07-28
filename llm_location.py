@@ -240,7 +240,7 @@ def normalize_location(loc: str):
 # direction word are handled here explicitly instead.
 _DIRECTION_TYPOS = {
     "east": "east", "eas": "east", "est": "east", "esat": "east", "eastt": "east",
-    "west": "west", "wst": "west", "wes": "west", "wast": "west",
+    "west": "west", "wst": "west", "wes": "west", "wast": "west", "wesr": "west",
     "north": "north", "nort": "north", "noth": "north", "norht": "north",
     "south": "south", "sout": "south", "suth": "south", "souht": "south",
 }
@@ -416,33 +416,55 @@ def _enrich_with_search(payload: dict, req: "LocationRequest") -> dict:
     return payload
 
 
+# TEMPORARY debug aid (2026-07-28): surfaces pending-clarification lookup
+# state directly in the /location response, not just server logs, since the
+# deployed backend has been hard to inspect live. WATI ignores unknown
+# response fields, so this is harmless to leave in a webhook body - but pull
+# it once the pending-clarification bug is confirmed fixed in production.
+def _debug_fields(phone: str, pending: list, match: Optional[str]) -> dict:
+    return {
+        "_debug_phone": phone,
+        "_debug_pending_found": "yes" if pending else "no",
+        "_debug_pending_candidates": "|".join(pending),
+        "_debug_local_match": match or "",
+    }
+
+
 def location(req: "LocationRequest") -> dict:
     raw = sanitise(req.message, 100)
     phone = sanitise(req.phone, 32)
 
-    if phone:
-        pending = appointments_db.get_pending_clarification(phone)
-        if pending:
-            match = _resolve_pending_reply(raw, pending)
-            if match:
-                normalized = normalize_location(match)
-                if normalized:
-                    appointments_db.clear_pending_clarification(phone)
-                    appointments_db.reset_location_retry(phone)
-                    payload = {
-                        "needs_clarification": "no",
-                        "clarify_question": "",
-                        "clarify_options": [],
-                        "normalized_location": "|".join(normalized),
-                        "handoff": "no",
-                    }
-                    return _enrich_with_search(payload, req)
-            # Nothing matched locally - fall through to the LLM below. Leave
-            # the pending candidates in place so a second bad guess this
-            # turn can still be checked against the same set.
+    print(f"[llm_location] /location call: phone={phone!r} raw={raw!r}")
+
+    pending = appointments_db.get_pending_clarification(phone) if phone else []
+    print(f"[llm_location] pending_clarification for phone={phone!r}: {pending!r}")
+
+    match = None
+    if pending:
+        match = _resolve_pending_reply(raw, pending)
+        print(f"[llm_location] _resolve_pending_reply(raw={raw!r}, candidates={pending!r}) -> {match!r}")
+        if match:
+            normalized = normalize_location(match)
+            if normalized:
+                appointments_db.clear_pending_clarification(phone)
+                appointments_db.reset_location_retry(phone)
+                payload = {
+                    "needs_clarification": "no",
+                    "clarify_question": "",
+                    "clarify_options": [],
+                    "normalized_location": "|".join(normalized),
+                    "handoff": "no",
+                }
+                payload.update(_debug_fields(phone, pending, match))
+                return _enrich_with_search(payload, req)
+            match = None  # normalize_location rejected it - treat as unmatched
+        # Nothing usable matched locally - fall through to the LLM below.
+        # Leave the pending candidates in place so a second guess this turn
+        # can still be checked against the same set.
 
     extracted = call_llm(raw)
     payload = _resolve(extracted, phone=phone)
+    payload.update(_debug_fields(phone, pending, match))
     return _enrich_with_search(payload, req)
 
 

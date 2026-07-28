@@ -22,6 +22,7 @@ from llm_location import (
     LocationRequest,
     location,
     _resolve,
+    _resolve_pending_reply,
     _validate_extraction,
     _failed_extraction,
     normalize_location,
@@ -190,6 +191,37 @@ class ResolvePipelineTests(unittest.TestCase):
             ["Dahisar East", "Dahisar West"],
         )
         appointments_db.clear_pending_clarification(self.phone)
+
+
+class ResolvePendingReplyTests(unittest.TestCase):
+    """Direct, no-DB, no-HTTP unit tests for _resolve_pending_reply() itself -
+    given a stored candidate set and a raw reply, does it pick the right one."""
+
+    CANDIDATES = ["Dahisar East", "Dahisar West"]
+
+    def test_bare_west_resolves_to_dahisar_west(self):
+        match = _resolve_pending_reply("West", self.CANDIDATES)
+        self.assertEqual(match, "Dahisar West")
+        # and the normalized_location the endpoint would return from it:
+        self.assertEqual(normalize_location(match), ["Dahisar West"])
+
+    def test_bare_east_resolves_to_dahisar_east(self):
+        match = _resolve_pending_reply("east", self.CANDIDATES)
+        self.assertEqual(match, "Dahisar East")
+
+    def test_exact_full_name_any_case(self):
+        self.assertEqual(_resolve_pending_reply("dahisar west", self.CANDIDATES), "Dahisar West")
+
+    def test_direction_typos(self):
+        self.assertEqual(_resolve_pending_reply("wesr", self.CANDIDATES), "Dahisar West")
+        self.assertEqual(_resolve_pending_reply("esat", self.CANDIDATES), "Dahisar East")
+
+    def test_no_match_returns_none(self):
+        self.assertIsNone(_resolve_pending_reply("banana", self.CANDIDATES))
+
+    def test_empty_reply_or_candidates_returns_none(self):
+        self.assertIsNone(_resolve_pending_reply("", self.CANDIDATES))
+        self.assertIsNone(_resolve_pending_reply("west", []))
 
 
 class PendingClarificationTests(unittest.TestCase):

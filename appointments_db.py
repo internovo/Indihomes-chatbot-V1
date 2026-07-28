@@ -136,6 +136,8 @@ def save_pending_clarification(phone: str, candidates: List[str]):
             (phone, json.dumps(candidates), datetime.utcnow().isoformat()),
         )
         conn.commit()
+        print(f"[appointments_db] saved pending_clarification phone={phone!r} "
+              f"candidates={candidates!r} db={DB_PATH!r}")
     finally:
         conn.close()
 
@@ -147,9 +149,13 @@ def get_pending_clarification(phone: str) -> List[str]:
             "SELECT candidates_json FROM pending_clarification WHERE lead_phone = ?", (phone,)
         ).fetchone()
         if not row:
+            print(f"[appointments_db] get_pending_clarification phone={phone!r}: NO ROW db={DB_PATH!r}")
             return []
         try:
-            return json.loads(row["candidates_json"])
+            candidates = json.loads(row["candidates_json"])
+            print(f"[appointments_db] get_pending_clarification phone={phone!r}: "
+                  f"found {candidates!r} db={DB_PATH!r}")
+            return candidates
         except (TypeError, ValueError):
             return []
     finally:
