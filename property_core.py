@@ -263,100 +263,56 @@ def detail_line(p) -> str:
     return "\n".join(parts)
 
 
-def _emph_to_whatsapp(s: str) -> str:
-    """Markdown emphasis -> WhatsApp. WhatsApp bold is a SINGLE '*', so both
-    '**bold**' and '*italic*' collapse to WhatsApp bold '*...*'. Also tidy spaces."""
-    s = s.replace("**", "*")               # '**bold**' -> '*bold*'
-    s = re.sub(r"[ \t]+", " ", s).strip()
-    return s
-
-
-def _intro_segment(raw: str) -> str:
-    """The lead of the description: the tagline + opening paragraph, i.e. the
-    text before the first structured section (Project Highlights / Carpet Area /
-    the first '---' rule / the second markdown heading). Everything after that
-    duplicates the emoji quick-facts block below, so we drop it to stay tidy."""
-    if not raw:
-        return ""
-    cut = len(raw)
-    # 2nd markdown heading (the 1st is the tagline we want to keep)
-    heads = [m.start() for m in re.finditer(r"(?m)^[ \t]*#{2,6}[ \t]+", raw)]
-    if len(heads) >= 2:
-        cut = min(cut, heads[1])
-    # first horizontal rule
-    m_rule = re.search(r"(?m)^[ \t]*-{3,}[ \t]*$", raw)
-    if m_rule:
-        cut = min(cut, m_rule.start())
-    # explicit section labels, in case headings/rules are absent
-    for label in ("Project Highlights", "Carpet Area", "Configuration:", "Structure:"):
-        i = raw.find(label)
-        if i != -1:
-            cut = min(cut, i)
-    return raw[:cut]
-
-
-def _clean_description(raw: str, limit: int = 550) -> str:
-    """Turn the API's raw markdown description into a tidy WhatsApp block:
-    headings become bold lines, '**' becomes WhatsApp bold, rules/extra blank
-    lines are dropped. Only the intro segment is kept (see _intro_segment)."""
-    seg = _intro_segment(raw)
-    if not seg:
-        return ""
-    out: List[str] = []
-    for ln in seg.replace("\r", "").split("\n"):
-        stripped = ln.strip()
-        if not stripped:
-            out.append("")
-            continue
-        if set(stripped) <= set("-–—*_ "):     # a rule / separator line
-            out.append("")
-            continue
-        h = re.match(r"^[ \t]*#{1,6}[ \t]*(.+?)[ \t]*$", ln)  # heading -> bold line
-        if h:
-            out.append(f"*{h.group(1).replace('**', '').replace('*', '').strip()}*")
-            continue
-        b = re.match(r"^[ \t]*[-*][ \t]+(.*)$", ln)          # bullet -> •
-        if b:
-            out.append(f"• {_emph_to_whatsapp(b.group(1))}")
-            continue
-        out.append(_emph_to_whatsapp(stripped))
-    text = re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
-    if len(text) > limit:                      # trim to a sentence boundary
-        c = text.rfind(". ", 0, limit)
-        text = text[:c + 1] if c > 120 else text[:limit].rstrip() + "…"
-    return text
+def property_url(p) -> str:
+    """Link to the property's page on the Indihomes website, built from its
+    project code (projectName). Empty if we don't have a code - never send a
+    broken link."""
+    code = (p.get("code") or "").strip()
+    return f"https://indihomes.co.in/properties/{code}" if code else ""
 
 
 def format_detail(p) -> str:
-    """Rich single-property block built ONLY from live API fields (no bespoke
-    marketing copy). Shown when the user picks a property number in Phase 3."""
-    lines = [f"🏙️ *{p.get('display_name') or p['name']}*"]
+    """Rich single-property block built ONLY from live API structured fields -
+    no raw `description` (it's Cosmos markdown WhatsApp can't render). Shown
+    when the user picks a property number in Phase 3. Ends with the Indihomes
+    website link instead of a brochure/media image."""
+    lines = [f"\U0001F3D9️ *{p.get('display_name') or p['name']}*"]
     loc = ", ".join(x for x in [(p.get("nearby") or "").strip(), p.get("location_label", "")] if x)
     if loc:
-        lines.append(f"📍 {loc}")
-    desc = _clean_description(p.get("description") or "")
-    if desc:
-        lines.append("")
-        lines.append(desc)
+        lines.append(f"\U0001F4CD {loc}")
     lines.append("")
+
     cfgs = " / ".join(p["configs_display"]) if p["configs_display"] else ""
     if cfgs:
-        lines.append(f"🏠 Configurations: {cfgs}")
+        lines.append(f"\U0001F3E0 Configurations: {cfgs}")
+
     carpet = p.get("carpet") or {}
-    cmin, cmax = carpet.get("min"), carpet.get("max")
-    unit = carpet.get("unit", "Sq. Ft.")
+    cmin, cmax = carpet.get("min"), carpet.get("max")   # already cast to float/None - handles the string-or-number quirk
     if cmin and cmax:
-        lines.append(f"📐 Carpet: {int(cmin)}–{int(cmax)} {unit}")
+        lines.append(f"\U0001F4D0 Carpet: {int(cmin)}–{int(cmax)} sq.ft")
     elif cmin or cmax:
-        lines.append(f"📐 Carpet: {int(cmin or cmax)} {unit}")
-    if p["price_cr"]:
-        lines.append(f"💰 Starting {p['price_cr']} Cr")
-    lines.append(f"🗓️ {possession_phrase(p)}")
+        lines.append(f"\U0001F4D0 Carpet: {int(cmin or cmax)} sq.ft")
+
+    price = f"{p['price_cr']} Cr" if p["price_cr"] else "Price on request"
+    lines.append(f"\U0001F4B0 Starting {price}")
+
+    if p.get("possession_raw"):
+        lines.append(f"\U0001F5D3️ Possession by {p['possession_raw']}")
+    else:
+        lines.append(f"\U0001F5D3️ {possession_phrase(p)}")
+
     if p.get("project_status"):
-        lines.append(f"🏗️ {p['project_status']}")
-    amen = ", ".join(p["amenities_display"][:6])
+        lines.append(f"\U0001F3D7️ {p['project_status']}")
+
+    amen = ", ".join(p["amenities_display"][:5])
     if amen:
         lines.append(f"✨ Highlights: {amen}")
+
+    url = property_url(p)
+    if url:
+        lines.append("")
+        lines.append(url)
+
     return "\n".join(lines)
 
 
