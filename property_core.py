@@ -271,11 +271,7 @@ def property_url(p) -> str:
     return f"https://indihomes.co.in/properties/{code}" if code else ""
 
 
-# Section labels/markers that start the Cosmos description's structured part
-# (Configuration tables, carpet sizes, feature bullets). Everything from the
-# first one onward duplicates the emoji quick-facts block, so the intro
-# paragraph stops there. Matched as plain substrings (not line-anchored)
-# because descriptions aren't reliably newline-clean.
+
 _DESC_SECTION_MARKERS = ("Project Highlights", "Carpet Area", "Configuration:",
                           "Structure:", "Key Features", "Amenities")
 
@@ -298,12 +294,6 @@ def _intro_raw_segment(raw: str) -> str:
 
 
 def _strip_markdown(s: str) -> str:
-    """Drop markdown syntax the description may still contain, down to plain
-    prose. No headings/rules should remain by this point, but bold/italic
-    markers and bullets can still appear inline. ALL asterisks are stripped
-    (not just '**' pairs) - some raw descriptions have an unmatched lone '*',
-    and WhatsApp treats every '*' as a bold toggle, so a single leftover one
-    corrupts the rest of the message."""
     s = s.replace("*", "")                            # bold/italic markers, matched or not
     s = re.sub(r"(?m)^[ \t]*[•\-][ \t]+", "", s)       # bullets at a line start
     s = s.replace("•", " ")                            # stray bullets mid-text
