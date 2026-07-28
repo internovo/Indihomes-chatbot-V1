@@ -179,6 +179,96 @@ class ResolvePipelineTests(unittest.TestCase):
         self.assertEqual(out["normalized_location"], "Kandivali West")
         self.assertEqual(out["handoff"], "no")
 
+    def test_ambiguous_response_saves_pending_clarification(self):
+        appointments_db.clear_pending_clarification(self.phone)
+        out = _resolve(_ok(location="Dahisar", ambiguous=True,
+                            candidates=["Dahisar East", "Dahisar West"], confidence=0.8),
+                        phone=self.phone)
+        self.assertEqual(out["needs_clarification"], "yes")
+        self.assertEqual(
+            appointments_db.get_pending_clarification(self.phone),
+            ["Dahisar East", "Dahisar West"],
+        )
+        appointments_db.clear_pending_clarification(self.phone)
+
+
+class PendingClarificationTests(unittest.TestCase):
+    """Exercises location()'s fast path: resolving a reply to a
+    just-offered clarification question locally, without another LLM call."""
+
+    def setUp(self):
+        self.phone = "919999900004"
+        appointments_db.reset_location_retry(self.phone)
+        appointments_db.clear_pending_clarification(self.phone)
+
+    def tearDown(self):
+        appointments_db.reset_location_retry(self.phone)
+        appointments_db.clear_pending_clarification(self.phone)
+
+    def _req(self, message):
+        return LocationRequest(message=message, phone=self.phone)
+
+    def _offer_dahisar_clarification(self):
+        """Puts this phone into the exact state _resolve() leaves it in
+        after asking 'Dahisar East or Dahisar West?' - no LLM call needed
+        to set this up."""
+        appointments_db.save_pending_clarification(self.phone, ["Dahisar East", "Dahisar West"])
+
+    @patch("llm_location.call_llm")
+    def test_exact_match_resolves_without_calling_the_llm(self, mock_llm):
+        self._offer_dahisar_clarification()
+        out = location(self._req("Dahisar West"))
+        mock_llm.assert_not_called()
+        self.assertEqual(out["needs_clarification"], "no")
+        self.assertEqual(out["normalized_location"], "Dahisar West")
+        self.assertEqual(appointments_db.get_pending_clarification(self.phone), [])
+
+    @patch("llm_location.call_llm")
+    def test_bare_direction_word_resolves_without_calling_the_llm(self, mock_llm):
+        self._offer_dahisar_clarification()
+        out = location(self._req("west"))
+        mock_llm.assert_not_called()
+        self.assertEqual(out["needs_clarification"], "no")
+        self.assertEqual(out["normalized_location"], "Dahisar West")
+
+        self._offer_dahisar_clarification()
+        out2 = location(self._req("East"))
+        mock_llm.assert_not_called()
+        self.assertEqual(out2["normalized_location"], "Dahisar East")
+
+    @patch("llm_location.call_llm")
+    def test_misspelled_direction_resolves_without_calling_the_llm(self, mock_llm):
+        self._offer_dahisar_clarification()
+        out = location(self._req("esat"))
+        mock_llm.assert_not_called()
+        self.assertEqual(out["needs_clarification"], "no")
+        self.assertEqual(out["normalized_location"], "Dahisar East")
+
+    @patch("llm_location.call_llm")
+    def test_unmatched_reply_falls_through_to_the_llm_and_keeps_pending_state(self, mock_llm):
+        self._offer_dahisar_clarification()
+        mock_llm.return_value = _ok(location=None, confidence=0.1)
+
+        out = location(self._req("banana"))
+
+        mock_llm.assert_called_once()
+        self.assertEqual(out["needs_clarification"], "yes")
+        # Nothing resolved locally - the same candidates must still be there
+        # so a second guess this turn can still be checked against them.
+        self.assertEqual(
+            appointments_db.get_pending_clarification(self.phone),
+            ["Dahisar East", "Dahisar West"],
+        )
+
+    def test_no_pending_state_goes_straight_to_the_llm(self):
+        # Sanity check: with nothing pending, the fast path has nothing to
+        # match against and must not short-circuit the normal LLM call.
+        with patch("llm_location.call_llm") as mock_llm:
+            mock_llm.return_value = _ok(location="Malad West", confidence=0.9)
+            out = location(self._req("Malad West"))
+            mock_llm.assert_called_once()
+            self.assertEqual(out["normalized_location"], "Malad West")
+
 
 class LocationHandlerTests(unittest.TestCase):
     """Exercises llm_location.location() - the function app.py's POST

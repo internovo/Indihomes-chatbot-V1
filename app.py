@@ -214,6 +214,7 @@ class FlexLocationRequest(BaseModel):
     message: Optional[str] = ""
     location: Optional[str] = ""
     location_text: Optional[str] = ""
+    phone: Optional[str] = "" 
 
     def best(self) -> str:
         for c in (self.location_text, self.message, self.location):
@@ -227,7 +228,7 @@ class FlexLocationRequest(BaseModel):
 def location(req: FlexLocationRequest):
     """Location understanding only. Returns needs_clarification yes/no,
     a clarify_question, and normalized_location."""
-    return location_handler(LocationRequest(message=req.best()))
+    return location_handler(LocationRequest(message=req.best() , phone=req.phone))
 
 
 @app.post("/debug-location")

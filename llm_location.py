@@ -20,11 +20,12 @@ Setup:
     .env:  GROQ_API_KEY=gsk_...  (free key: https://console.groq.com/keys)
 """
 
+import difflib
 import os
 import re
 import json
 from pydantic import BaseModel
-from typing import Optional
+from typing import List, Optional
 
 from property_core import KNOWN_LOCALITIES_LOWER, search
 from sanitize import sanitise
@@ -232,6 +233,61 @@ def normalize_location(loc: str):
     return validate_candidates([loc])
 
 
+# Common short/misspelled ways people answer a "which direction?" question.
+# Deliberately a fixed lookup rather than fuzzy-matched against the direction
+# words themselves - difflib's ratio on 4-letter words ties/misranks easily
+# (e.g. "esat" scores equally close to "west" as to "east"), so typos of the
+# direction word are handled here explicitly instead.
+_DIRECTION_TYPOS = {
+    "east": "east", "eas": "east", "est": "east", "esat": "east", "eastt": "east",
+    "west": "west", "wst": "west", "wes": "west", "wast": "west",
+    "north": "north", "nort": "north", "noth": "north", "norht": "north",
+    "south": "south", "sout": "south", "suth": "south", "souht": "south",
+}
+
+
+def _match_bare_direction(reply: str, candidates: List[str]) -> Optional[str]:
+    """reply is just a direction word (or a common typo of one) - if exactly
+    one offered candidate ends in that direction, that's the match. Two
+    candidates ending in the same direction (shouldn't happen for our
+    East/West splits, but landmark-based candidate sets aren't guaranteed
+    direction-suffixed at all) is treated as still ambiguous, not guessed."""
+    direction = _DIRECTION_TYPOS.get(reply)
+    if not direction:
+        return None
+    hits = [c for c in candidates if c.strip().lower().endswith(" " + direction)]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _resolve_pending_reply(raw: str, candidates: List[str]) -> Optional[str]:
+    """Try to resolve a reply against a set of candidates we already offered
+    ("Dahisar East or Dahisar West?"), without another LLM round trip:
+      a. exact (case-insensitive) match against a candidate
+      b. a bare direction word, or a common typo of one
+      c. a general fuzzy match, for other misspellings of the full name
+    Returns the matched candidate (original casing) or None."""
+    if not raw or not candidates:
+        return None
+    reply = raw.strip().lower()
+    if not reply:
+        return None
+
+    for c in candidates:
+        if c.strip().lower() == reply:
+            return c
+
+    direction_match = _match_bare_direction(reply, candidates)
+    if direction_match:
+        return direction_match
+
+    lowered = {c.strip().lower(): c for c in candidates}
+    close = difflib.get_close_matches(reply, list(lowered.keys()), n=1, cutoff=0.6)
+    if close:
+        return lowered[close[0]]
+
+    return None
+
+
 class LocationRequest(BaseModel):
     message: str = ""
     phone: Optional[str] = ""
@@ -249,7 +305,12 @@ RETRY_QUESTIONS = [
 ]
 
 
-def _give_up() -> dict:
+def _give_up(phone: str = "") -> dict:
+    if phone:
+        # The location question is over either way (handing off to a human) -
+        # don't let a stale offered-candidates set leak into whatever the
+        # customer says next.
+        appointments_db.clear_pending_clarification(phone)
     return {
         "needs_clarification": "no",
         "clarify_question": "",
@@ -264,7 +325,7 @@ def _ask_again(phone: str) -> dict:
     clarification question, or hands off on the 3rd failed attempt."""
     attempt = appointments_db.increment_location_retry(phone)
     if attempt >= 3:
-        return _give_up()
+        return _give_up(phone)
     question = RETRY_QUESTIONS[1] if attempt >= 2 else RETRY_QUESTIONS[0]
     return {
         "needs_clarification": "yes",
@@ -292,7 +353,13 @@ def _resolve(extracted: dict, phone: str = "") -> dict:
     if ambiguous and len(candidates) >= 2:
         if phone:
             appointments_db.reset_location_retry(phone)
-        opts = " or ".join(candidates[:3])
+        opts_list = candidates[:3]
+        if phone:
+            # Remember exactly what we offered, so a short/misspelled reply
+            # next turn ("west", "esat") can be resolved locally instead of
+            # going back to the LLM with no memory of this question.
+            appointments_db.save_pending_clarification(phone, opts_list)
+        opts = " or ".join(opts_list)
         landmark = extracted.get("landmark")
         if landmark:
             question = "There's more than one " + str(landmark) + " in Mumbai. Which area did you mean - " + opts + "?"
@@ -301,7 +368,7 @@ def _resolve(extracted: dict, phone: str = "") -> dict:
         return {
             "needs_clarification": "yes",
             "clarify_question": question,
-            "clarify_options": candidates[:3],
+            "clarify_options": opts_list,
             "normalized_location": "",
             "handoff": "no",
         }
@@ -321,6 +388,9 @@ def _resolve(extracted: dict, phone: str = "") -> dict:
 
     if phone:
         appointments_db.reset_location_retry(phone)
+        # A clarification (if any was pending) is now resolved via the
+        # normal LLM path - don't let it leak into a later, unrelated turn.
+        appointments_db.clear_pending_clarification(phone)
     return {
         "needs_clarification": "no",
         "clarify_question": "",
@@ -330,13 +400,9 @@ def _resolve(extracted: dict, phone: str = "") -> dict:
     }
 
 
-def location(req: "LocationRequest") -> dict:
-    raw = sanitise(req.message, 100)
-    phone = sanitise(req.phone, 32)
-
-    extracted = call_llm(raw)
-    payload = _resolve(extracted, phone=phone)
-
+def _enrich_with_search(payload: dict, req: "LocationRequest") -> dict:
+    """If the caller also sent search criteria alongside the location, run
+    the search now rather than making the flow round-trip again."""
     if payload["needs_clarification"] == "no" and any(
         [req.configuration, req.budget, req.amenities, req.possession]
     ):
@@ -348,6 +414,36 @@ def location(req: "LocationRequest") -> dict:
             possession=sanitise(req.possession, 100),
         ))
     return payload
+
+
+def location(req: "LocationRequest") -> dict:
+    raw = sanitise(req.message, 100)
+    phone = sanitise(req.phone, 32)
+
+    if phone:
+        pending = appointments_db.get_pending_clarification(phone)
+        if pending:
+            match = _resolve_pending_reply(raw, pending)
+            if match:
+                normalized = normalize_location(match)
+                if normalized:
+                    appointments_db.clear_pending_clarification(phone)
+                    appointments_db.reset_location_retry(phone)
+                    payload = {
+                        "needs_clarification": "no",
+                        "clarify_question": "",
+                        "clarify_options": [],
+                        "normalized_location": "|".join(normalized),
+                        "handoff": "no",
+                    }
+                    return _enrich_with_search(payload, req)
+            # Nothing matched locally - fall through to the LLM below. Leave
+            # the pending candidates in place so a second bad guess this
+            # turn can still be checked against the same set.
+
+    extracted = call_llm(raw)
+    payload = _resolve(extracted, phone=phone)
+    return _enrich_with_search(payload, req)
 
 
 def location_debug(req: "LocationRequest") -> dict:
