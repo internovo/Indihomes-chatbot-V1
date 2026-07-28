@@ -300,11 +300,11 @@ def _strip_markdown(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()              # collapse whitespace/newlines
 
 
-def clean_description(raw: str, limit: int = 300) -> str:
-    """Short, clean intro paragraph for the detail message: strip all
-    markdown, keep only the opening prose (before any structured section),
-    then cap it at ~1-2 sentences / `limit` chars, cut at a sentence boundary
-    - never mid-sentence, never the whole field."""
+def clean_description(raw: str, limit: int = 500) -> str:
+    """Clean intro paragraph for the detail message: strip all markdown, keep
+    only the opening prose (before any structured section), then cap it at
+    ~3-4 sentences / `limit` chars, cut at a sentence boundary - never
+    mid-sentence, never mid-word, never the whole field."""
     if not raw:
         return ""
     text = _strip_markdown(_intro_raw_segment(raw))
@@ -313,7 +313,7 @@ def clean_description(raw: str, limit: int = 300) -> str:
     ends = [m.end() for m in re.finditer(r"[.!?](?:\s|$)", text)]
     cut = 0
     for i, e in enumerate(ends):
-        if i >= 2 or e > limit:
+        if i >= 4 or e > limit:
             break
         cut = e
     if not cut:
