@@ -172,6 +172,7 @@ def property_detail(req: PropertyDetailRequest):
         "name": item.get("name", ""),
         "detail": item.get("detail", ""),
         "image_url": item.get("image", ""),
+        "code": item.get("code", ""),
     }
 
 
