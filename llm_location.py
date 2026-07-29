@@ -239,8 +239,8 @@ def normalize_location(loc: str):
 # (e.g. "esat" scores equally close to "west" as to "east"), so typos of the
 # direction word are handled here explicitly instead.
 _DIRECTION_TYPOS = {
-    "east": "east", "eas": "east", "est": "east", "esat": "east", "eastt": "east",
-    "west": "west", "wst": "west", "wes": "west", "wast": "west", "wesr": "west",
+    "east": "east", "eas": "east", "est": "east", "esat": "east", "eastt": "east", "easy": "east",
+    "west": "west", "wst": "west", "wes": "west", "wast": "west", "wesr": "west","wesy":"west",
     "north": "north", "nort": "north", "noth": "north", "norht": "north",
     "south": "south", "sout": "south", "suth": "south", "souht": "south",
 }
@@ -264,7 +264,12 @@ def _resolve_pending_reply(raw: str, candidates: List[str]) -> Optional[str]:
     ("Dahisar East or Dahisar West?"), without another LLM round trip:
       a. exact (case-insensitive) match against a candidate
       b. a bare direction word, or a common typo of one
-      c. a general fuzzy match, for other misspellings of the full name
+      c. a general fuzzy match, for other misspellings of the full name -
+         but ONLY if the reply is clearly closer to exactly one candidate.
+    A reply like the bare area name itself ("Goregaon", when the candidates
+    are "Goregaon East"/"Goregaon West") is roughly equidistant from both
+    options - that's still genuinely ambiguous, not a typo of one specific
+    candidate, so it must fall through to asking again rather than guessing.
     Returns the matched candidate (original casing) or None."""
     if not raw or not candidates:
         return None
@@ -281,8 +286,11 @@ def _resolve_pending_reply(raw: str, candidates: List[str]) -> Optional[str]:
         return direction_match
 
     lowered = {c.strip().lower(): c for c in candidates}
-    close = difflib.get_close_matches(reply, list(lowered.keys()), n=1, cutoff=0.6)
-    if close:
+    # Require the match to be clearly closer to ONE candidate than the
+    # others - ask for the top 2 matches; only accept if there's exactly
+    # one hit within the cutoff (i.e. not tied/ambiguous between two).
+    close = difflib.get_close_matches(reply, list(lowered.keys()), n=2, cutoff=0.6)
+    if len(close) == 1:
         return lowered[close[0]]
 
     return None

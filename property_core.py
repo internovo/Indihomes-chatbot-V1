@@ -413,6 +413,40 @@ def format_detail(p) -> str:
     return result
 
 
+# --------------------------------------------------------------------------
+# amenities: generic ("all of it" / "doesn't matter") reply handling
+# --------------------------------------------------------------------------
+# When the customer doesn't name specific amenities but instead says
+# something like "all of it" or "doesn't matter", the normal keyword-overlap
+# scoring (amenity_score below) gives every property a score of 0, since
+# there's nothing to match against - so no real ranking happens and results
+# end up in an arbitrary order. Detecting this case and ranking by "richest
+# amenity list" instead is a much better read of what the customer meant.
+_GENERIC_AMENITY_PHRASES = {
+    "all", "all of it", "all of them", "everything", "any", "anything",
+    "any amenity", "any amenities", "no preference", "doesn't matter",
+    "does not matter", "not sure", "whatever", "any is fine", "all fine",
+    "don't care", "dont care", "no specific preference", "not particular",
+}
+
+
+def _wants_generic_amenities(text: str) -> bool:
+    """True if the reply expresses 'I want everything / no preference' rather
+    than naming specific amenities. Checked BEFORE the normal keyword split,
+    so a reply like this never gets tokenized into meaningless word-fragments
+    that then all fail to match anything."""
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if t in _GENERIC_AMENITY_PHRASES:
+        return True
+    # Loose contains-check for short free-text variants like "all of it please"
+    # or "honestly it doesn't matter to me" - only check phrases long enough
+    # (>3 chars) to avoid accidental substring hits on short real amenity
+    # names typed alongside other words.
+    return any(phrase in t for phrase in _GENERIC_AMENITY_PHRASES if len(phrase) > 3)
+
+
 def search(location="", configuration="", budget="", amenities="", possession="", limit=3, **_) -> Dict:
     """The one property search. Now returns up to `limit` results (default 3;
     pass 5 for the new pick-a-property flow). Filtering stays local Python over
@@ -422,7 +456,13 @@ def search(location="", configuration="", budget="", amenities="", possession=""
     loc = clean(location).lower()
     cfg = norm_config(clean(configuration))
     ceiling = budget_ceiling(clean(budget))
-    wanted_amenities = [a.strip().lower() for a in clean(amenities).replace(",", " ").split() if a.strip()]
+
+    raw_amenities = clean(amenities)
+    generic_amenities = _wants_generic_amenities(raw_amenities)
+    wanted_amenities = [] if generic_amenities else [
+        a.strip().lower() for a in raw_amenities.replace(",", " ").split() if a.strip()
+    ]
+
     ready_only = "ready" in clean(possession).lower() and "only" in clean(possession).lower()
 
     loc_terms = [t.strip() for t in re.split(r"[|,]", loc) if t.strip()]
@@ -454,6 +494,11 @@ def search(location="", configuration="", budget="", amenities="", possession=""
         return True
 
     def amenity_score(p):
+        if generic_amenities:
+            # "All of it" / "doesn't matter" - rank by how amenity-rich the
+            # property is overall, instead of by keyword overlap (which
+            # would be meaningless here since nothing specific was named).
+            return len(p["amenities"])
         return sum(1 for a in wanted_amenities if any(a in am for am in p["amenities"]))
 
     results = [p for p in PROPERTIES if matches(p)]
