@@ -344,6 +344,39 @@ def _ask_again(phone: str) -> dict:
     }
 
 
+def _area_unavailable(phone: str, loc: str) -> dict:
+    """The LLM correctly understood a real Mumbai locality name, but we have
+    zero properties listed there right now (normalize_location came back
+    empty against real inventory, not a whitelist of area names in general).
+
+    Reuses the same needs_clarification=yes path _ask_again() uses, so no
+    WATI flow/JSON changes are needed - the customer's next reply routes
+    through the exact same main_question-clarify -> main_webhook-loc2 loop
+    that already exists. Only the message text differs: honest and specific
+    instead of the generic 'I didn't catch that' retry copy.
+
+    Resets the retry counter rather than incrementing it - naming a real,
+    specific area we simply don't cover is not the same kind of failure as
+    the bot not understanding the customer, and shouldn't count toward the
+    3-attempt handoff threshold.
+    """
+    if phone:
+        appointments_db.reset_location_retry(phone)
+        appointments_db.clear_pending_clarification(phone)
+    return {
+        "needs_clarification": "yes",
+        "clarify_question": (
+            f"Sorry, we don't currently have any properties listed in {loc}. "
+            "We specialise in the western suburbs - would you like to try an "
+            "area like Malad, Goregaon, Kandivali, Borivali or Dahisar instead?"
+        ),
+        "clarify_options": [],
+        "normalized_location": "",
+        "handoff": "no",
+        "area_unavailable": "yes",
+    }
+
+
 def _resolve(extracted: dict, phone: str = "") -> dict:
     phone = (phone or "").strip()
 
@@ -387,11 +420,19 @@ def _resolve(extracted: dict, phone: str = "") -> dict:
 
     # normalize_location only ever returns whitelisted KNOWN_LOCALITIES
     # values - if the model named somewhere we have no inventory in (or
-    # anything else that doesn't match), this comes back empty and we treat
-    # it as a failed extraction rather than search on / return an
-    # unvalidated location.
+    # anything else that doesn't match), this comes back empty.
     normalized = normalize_location(loc)
     if not normalized:
+        # Two different situations were previously treated as identical:
+        # (a) we genuinely couldn't parse what the customer said, vs
+        # (b) the LLM understood a real, specific Mumbai locality just fine
+        #     - it simply isn't anywhere we have inventory.
+        # Only (a) should get the generic "could you tell me the area
+        # again?" retry copy. (b) deserves an honest, specific reply -
+        # looping generic retry copy on a real area name reads as the bot
+        # not recognising basic Mumbai geography, which erodes trust fast.
+        if loc and confidence >= 0.5:
+            return _area_unavailable(phone, loc)
         return _ask_again(phone)
 
     if phone:
