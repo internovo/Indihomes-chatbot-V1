@@ -72,6 +72,12 @@ def _post_json(url: str, payload: dict) -> bool:
         headers={
             "Authorization": _api_key(),
             "Content-Type": "application/json",
+            # Without this, urllib sends its default "Python-urllib/3.x"
+            # User-Agent, which Cloudflare's WAF (sitting in front of WATI)
+            # blocks outright with error 1010 ("banned based on your
+            # browser's signature") before the request ever reaches WATI's
+            # application layer. A normal-looking UA avoids that filter.
+            "User-Agent": "Mozilla/5.0 (compatible; IndihomesBot/1.0)",
         },
         method="POST",
     )
