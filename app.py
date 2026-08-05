@@ -44,8 +44,19 @@ import calendar_service
 import appointments_db
 import email_service
 import crm_service
+import conversation_lock
+import conversation_tracker
+import wati_client
+from models import PriorityParseRequest
 
 app = FastAPI()
+
+# Start the background follow-up scheduler (every 5 min sweep).
+# Imported here so it starts exactly once, at process startup, after the
+# FastAPI app object exists. Kept after `app = FastAPI()` to match the
+# pattern in calendar_service / email_service — deps after app, not before.
+import followup_scheduler as _followup_scheduler
+_followup_scheduler.start()
 
 
 def _clean_incoming(value: str) -> str:
@@ -129,19 +140,59 @@ def run_pipeline(req: SearchRequest, limit: int = 5):
     return result, raw_location
 
 
+def _search_in_progress_response() -> dict:
+    """Flat shape matching /search's normal response, used when the
+    conversation lock is already held for this phone (a double-tap or a
+    WATI webhook retry arrived while the first request is still running).
+    Same keys as the real response so nothing downstream in the WATI flow
+    breaks reading @recommendations / @count / etc. from this reply."""
+    out = {
+        "recommendations": ("Still working on your last request - one moment "
+                            "and I'll have your recommendations."),
+        "min_price": "", "max_price": "", "count": 0, "shortlist": [],
+        "resolved_location": "",
+        "search_in_progress": "yes",
+        "conversation_locked": "yes",
+    }
+    for i in range(1, 4):
+        out[f"name{i}"] = out[f"detail{i}"] = out[f"image{i}"] = out[f"code{i}"] = ""
+    return out
+
+
 @app.post("/search")
 def one_call_search(req: SearchRequest):
     """THE endpoint the chatbot should call at the end of the conversation.
     Now returns up to 5 numbered results and remembers the shortlist (keyed on
-    phone) so /property-detail can resolve the number the user replies with."""
-    result, _ = run_pipeline(req, limit=5)
+    phone) so /property-detail can resolve the number the user replies with.
+
+    Wrapped in the conversation lock: this is the exact webhook node a rapid
+    double-tap on the final priority question used to race against (two
+    events reading the same pre-transition state). Keyed on phone; a second
+    event for the same phone while the first is still running is turned away
+    with a lightweight 'still working' response instead of racing it."""
     phone = _clean_incoming(req.phone)
-    if phone and result.get("shortlist"):
-        try:
-            appointments_db.save_shortlist(phone, result["shortlist"])
-        except Exception as e:
-            print(f"[app] could not save shortlist: {e}")
-    return result
+    if not conversation_lock.acquire(phone):
+        return _search_in_progress_response()
+    try:
+        result, _ = run_pipeline(req, limit=5)
+        if phone and result.get("shortlist"):
+            try:
+                appointments_db.save_shortlist(phone, result["shortlist"])
+            except Exception as e:
+                print(f"[app] could not save shortlist: {e}")
+        result["search_in_progress"] = "no"
+        result["conversation_locked"] = "no"
+        # Start the 2-hour re-engagement timer only if recommendations were
+        # actually found — no point chasing a phone where the search returned
+        # nothing. Best-effort: a tracker failure must never fail the response.
+        if phone and result.get("count"):
+            try:
+                conversation_tracker.touch_bot_message(phone)
+            except Exception as e:
+                print(f"[app] conversation_tracker.touch_bot_message failed: {e}")
+        return result
+    finally:
+        conversation_lock.release(phone)
 
 
 class PropertyDetailRequest(BaseModel):
@@ -155,6 +206,12 @@ def property_detail(req: PropertyDetailRequest):
     and return that project's full detail block + image URL for WATI to send."""
     phone = _clean_incoming(req.phone)
     choice = _clean_incoming(req.choice)
+    # User is actively engaging — cancel the pending follow-up timer.
+    if phone:
+        try:
+            conversation_tracker.touch_user_message(phone)
+        except Exception as e:
+            print(f"[app] conversation_tracker.touch_user_message failed: {e}")
 
     items = appointments_db.get_shortlist(phone) if phone else []
     if not items:
@@ -263,6 +320,104 @@ def _parse_choice(choice: str, slot_count: int) -> Optional[int]:
     return None
 
 
+_PRIORITY_LABELS = {
+    "possession": "Near Possession",
+    "amenities": "Amenities",
+    "builder": "A Reputed Builder",
+}
+
+
+@app.post("/parse-priorities")
+def parse_priorities(req: PriorityParseRequest):
+    """Turns the free-text reply to 'Which factors matter? (1,2,3)' into
+    flat yes/no strings WATI's Condition nodes can branch on directly with
+    Equal (the only comparison confirmed to work reliably in this workflow -
+    see claude.md). Accepts digits ('1,2'), words ('possession and
+    amenities'), or a mix; unrecognisable input asks about all three rather
+    than silently dropping the customer's stated interest in 'multiple'.
+
+    Stateless and side-effect free (no DB write, no external call), so this
+    endpoint does not need the conversation lock - there is nothing here a
+    duplicate/rapid call could corrupt."""
+    raw = _clean_incoming(req.priority_selection).lower()
+
+    numbers = set(re.findall(r"\d", raw))
+    want_possession = "1" in numbers or "possession" in raw
+    want_amenities = "2" in numbers or "amenit" in raw
+    want_builder = "3" in numbers or "builder" in raw
+
+    if not (want_possession or want_amenities or want_builder):
+        want_possession = want_amenities = want_builder = True
+
+    chosen = []
+    if want_possession:
+        chosen.append(_PRIORITY_LABELS["possession"])
+    if want_amenities:
+        chosen.append(_PRIORITY_LABELS["amenities"])
+    if want_builder:
+        chosen.append(_PRIORITY_LABELS["builder"])
+
+    return {
+        "want_possession": "yes" if want_possession else "no",
+        "want_amenities": "yes" if want_amenities else "no",
+        "want_builder": "yes" if want_builder else "no",
+        "priority_list": ", ".join(chosen),
+        "multiple_priority": "yes",
+    }
+
+
+# --------------------------------------------------------------------------
+# Follow-up: user tapped "Talk to an Advisor" from the re-engagement message.
+# Notifies all advisors by email and permanently closes the conversation so
+# the scheduler never sends another nudge to this phone.
+# --------------------------------------------------------------------------
+
+class AdvisorRequestRequest(BaseModel):
+    phone: Optional[str] = ""
+    name: Optional[str] = ""
+
+
+@app.post("/advisor-request")
+def advisor_request(req: AdvisorRequestRequest):
+    """Called when a user taps 'Talk to an Advisor' on the WATI follow-up
+    message. Emails all advisors and closes the conversation tracking row.
+
+    Reuses email_service.send_booking_notification as-is — it already handles
+    missing lead details gracefully (no slot_label, no property_ref etc.) and
+    logs + returns False on any failure without raising. The response is always
+    200 so WATI doesn't retry; we degrade to "advisor will call" if email fails.
+
+    Wrapped in the conversation lock — a rapid double-tap on the button would
+    otherwise fire two advisor emails for the same lead."""
+    phone = _clean_incoming(req.phone)
+    name = _clean_incoming(req.name)
+
+    if not phone:
+        return {"notified": "no", "message": "Couldn't identify your number. An advisor will be in touch shortly."}
+
+    if not conversation_lock.acquire(phone):
+        return {"notified": "no", "message": "Still processing — please wait a moment."}
+
+    try:
+        advisors = calendar_service.advisor_emails()
+        email_service.send_booking_notification(advisors, {
+            "name": name,
+            "phone": phone,
+            "appt_type": "followup_advisor_request",
+        })
+        # Mark the conversation closed so the scheduler never sends another nudge.
+        try:
+            conversation_tracker.close_conversation(phone)
+        except Exception as e:
+            print(f"[app] conversation_tracker.close_conversation failed: {e}")
+        return {
+            "notified": "yes",
+            "message": "Perfect! An Indihomes advisor will contact you shortly.",
+        }
+    finally:
+        conversation_lock.release(phone)
+
+
 class AvailableSlotsRequest(BaseModel):
     phone: Optional[str] = ""
     appt_type: Optional[str] = "site_visit"
@@ -274,6 +429,12 @@ def available_slots(req: AvailableSlotsRequest):
     remembers them (keyed on phone) so /book-slot can resolve their reply."""
     phone = _clean_incoming(req.phone)
     appt_type = _clean_incoming(req.appt_type) or "site_visit"
+    # User actively requesting slots — cancel any pending follow-up.
+    if phone:
+        try:
+            conversation_tracker.touch_user_message(phone)
+        except Exception as e:
+            print(f"[app] conversation_tracker.touch_user_message failed: {e}")
 
     if not phone:
         return {
@@ -325,6 +486,13 @@ def book_slot(req: BookSlotRequest):
     them, books the calendar event, and stores the appointment."""
     phone = _clean_incoming(req.phone)
     choice = _clean_incoming(req.choice)
+    # User actively booking — cancel follow-up timer immediately, before any
+    # lock acquisition, so even a lock-miss doesn't leave a stale timer.
+    if phone:
+        try:
+            conversation_tracker.touch_user_message(phone)
+        except Exception as e:
+            print(f"[app] conversation_tracker.touch_user_message failed: {e}")
     name = _clean_incoming(req.name)
     appt_type = _clean_incoming(req.appt_type) or "site_visit"
     property_ref = _clean_incoming(req.property_ref)
@@ -334,6 +502,28 @@ def book_slot(req: BookSlotRequest):
     if not phone:
         return {"booked": "no", "message": fallback_message, "advisor": "", "slot_label": ""}
 
+    # Booking has real side effects (Google Calendar event, DB row, advisor
+    # email) - a duplicate webhook retry or a fast double-tap on the slot
+    # number must not book twice. A lock-miss returns the SAME shape as
+    # "couldn't parse your choice" so it lands on the existing retry message
+    # in the WATI flow rather than needing a new branch.
+    if not conversation_lock.acquire(phone):
+        return {
+            "booked": "no",
+            "message": "Still processing your previous request - please wait a moment.",
+            "advisor": "", "slot_label": "",
+        }
+
+    try:
+        return _book_slot_locked(phone, choice, name, appt_type, property_ref, req, fallback_message)
+    finally:
+        conversation_lock.release(phone)
+
+
+def _book_slot_locked(phone, choice, name, appt_type, property_ref, req, fallback_message):
+    """The original /book-slot body, now run only while the conversation
+    lock for `phone` is held (see book_slot() above). Split out so the route
+    function itself stays a thin acquire/release wrapper."""
     pending = appointments_db.get_pending_slots(phone)
     if not pending:
         return {
@@ -406,6 +596,12 @@ def book_slot(req: BookSlotRequest):
     })
 
     advisor_name = _advisor_display_name(advisor_email)
+    # Booking confirmed — close the conversation so the scheduler never
+    # sends a follow-up nudge to a lead who just booked a site visit.
+    try:
+        conversation_tracker.close_conversation(phone)
+    except Exception as e:
+        print(f"[app] conversation_tracker.close_conversation failed: {e}")
     return {
         "booked": "yes",
         "message": f"Appointment confirmed for {slot['label']}. Our Advisor from Indihomes will Contact you.",
@@ -449,6 +645,22 @@ def save_lead(req: SaveLeadRequest):
     if not phone:
         return {"saved": "no", "message": "No phone on record.", "dry_run": "yes"}
 
+    # A duplicate webhook retry must not push the same lead to the CRM twice.
+    if not conversation_lock.acquire(phone):
+        return {
+            "saved": "no",
+            "message": "Still processing your previous request - please wait a moment.",
+            "dry_run": "yes",
+        }
+    try:
+        return _save_lead_locked(req, phone)
+    finally:
+        conversation_lock.release(phone)
+
+
+def _save_lead_locked(req: SaveLeadRequest, phone: str):
+    """The original /save-lead body, now run only while the conversation
+    lock for `phone` is held (see save_lead() above)."""
     outcome = (_clean_incoming(req.outcome) or "details_shared").lower()
     main_status, sub_status = OUTCOME_STATUS.get(outcome, ("Interested", "Details Shared"))
 
@@ -490,6 +702,12 @@ def save_lead(req: SaveLeadRequest):
         "user_type": user_type,
     })
 
+    # Lead saved — close the conversation regardless of CRM success so the
+    # scheduler doesn't nudge a lead who has already reached this endpoint.
+    try:
+        conversation_tracker.close_conversation(phone)
+    except Exception as e:
+        print(f"[app] conversation_tracker.close_conversation failed: {e}")
     return {
         "saved": "yes" if result.get("ok") else "no",
         "message": "Your details are noted; our team will be in touch."
@@ -505,6 +723,8 @@ def health():
     llm = ("groq: loaded (ends ..." + groq[-4:] + "), model=" + GROQ_MODEL) if groq else "NO KEY LOADED"
     calendar_status = "connected" if calendar_service.is_configured() else "NOT CONFIGURED"
     email_status = "connected" if email_service.is_configured() else "NOT CONFIGURED"
+    wati_status = "connected" if wati_client.is_configured() else "NOT CONFIGURED"
+    scheduler_status = "running" if _followup_scheduler._scheduler_running() else "NOT RUNNING"
     return {
         "status": "ok",
         "properties_loaded": len(PROPERTIES),
@@ -512,5 +732,7 @@ def health():
         "llm": llm,
         "calendar": calendar_status,
         "email": email_status,
+        "wati": wati_status,
+        "scheduler": scheduler_status,
         "advisors_loaded": len(calendar_service.advisor_emails()),
     }
