@@ -49,6 +49,7 @@ import crm_service
 import conversation_lock
 import conversation_tracker
 import intent_router
+import business_hours
 import wati_client
 from models import PriorityParseRequest
 
@@ -68,6 +69,64 @@ def _clean_incoming(value: str) -> str:
     if v.startswith("{{") and v.endswith("}}"):
         return ""
     return v
+
+
+# --------------------------------------------------------------------------
+# Business-hours gating (10 AM - 7 PM IST). See
+# Indihomes_Business_Hours_Gating.docx and claude.md's "Business hours
+# gating" task section for the full design rationale.
+#
+# WATI cannot gate this itself - its own business-hours settings only
+# govern WATI's native Team Inbox / Knowbot routing, not a custom
+# webhook-driven flow like this one (see business_hours.py's module
+# docstring). Every endpoint below that produces text a customer actually
+# reads checks _off_hours_text() first and, if closed, skips its normal
+# processing entirely (no LLM call, no search, no calendar booking) and
+# returns a degraded, endpoint-shaped response instead - never a 500,
+# same contract as everything else in this file.
+# --------------------------------------------------------------------------
+
+_OFF_HOURS_NOTICE = (
+    "Thanks for reaching out! Our team is available 10 AM - 7 PM IST. "
+    "We'll get back to you as soon as we're open again. \U0001F642"
+)
+_OFF_HOURS_SHORT = "We're currently closed - back at 10 AM IST."
+
+
+def _off_hours_text(phone: str) -> Optional[str]:
+    """Returns None if within business hours - caller should proceed with
+    its normal processing. Returns a string to use as the customer-facing
+    reply if we're off hours: the full one-time notice on the FIRST
+    off-hours message today for this phone, a short repeat line on every
+    off-hours message after that.
+
+    DESIGN NOTE - this deviates slightly from a literal reading of the
+    design doc's "repeat messages... don't trigger repeat notices", which
+    could be read as implying true silence on repeat messages. That's not
+    expressible here: this is a SYNCHRONOUS, reactive webhook endpoint -
+    WATI is blocked waiting on a response to every single call it makes,
+    and every downstream WATI Message/Question node needs SOME text to
+    render. Returning "" risks an error or a blank chat bubble rather than
+    a clean no-op. So repeat off-hours messages get a short, DISTINCT line
+    instead of the full notice repeated - the same paragraph never shows
+    twice, which satisfies the spirit of "no repeat notices" within what
+    this request/response shape can actually do.
+
+    Best-effort on the DB write: a tracker failure must never block the
+    customer from getting a reply, so a failure here still returns the
+    text - it would just mean this phone's next off-hours message ALSO
+    gets the full notice instead of the short one, which is a harmless
+    degrade, not a broken conversation.
+    """
+    if business_hours.is_business_hours():
+        return None
+    if phone and conversation_tracker.should_send_off_hours_notice(phone):
+        try:
+            conversation_tracker.mark_off_hours_notified(phone)
+        except Exception as e:
+            print(f"[app] mark_off_hours_notified failed: {e}")
+        return _OFF_HOURS_NOTICE
+    return _OFF_HOURS_SHORT
 
 
 class SearchRequest(BaseModel):
@@ -174,6 +233,14 @@ def one_call_search(req: SearchRequest):
     event for the same phone while the first is still running is turned away
     with a lightweight 'still working' response instead of racing it."""
     phone = _clean_incoming(req.phone)
+    off_hours_text = _off_hours_text(phone)
+    if off_hours_text is not None:
+        out = _search_in_progress_response()
+        out["recommendations"] = off_hours_text
+        out["search_in_progress"] = "no"
+        out["conversation_locked"] = "no"
+        out["business_hours"] = "no"
+        return out
     if not conversation_lock.acquire(phone):
         return _search_in_progress_response()
     try:
@@ -229,6 +296,12 @@ def property_detail(req: PropertyDetailRequest):
             conversation_tracker.touch_user_message(phone)
         except Exception as e:
             print(f"[app] conversation_tracker.touch_user_message failed: {e}")
+
+    off_hours_text = _off_hours_text(phone)
+    if off_hours_text is not None:
+        return {"found": "no", "name": "", "image_url": "", "code": "",
+                "detail": off_hours_text, "intent": "none", "is_global": "no",
+                "business_hours": "no"}
 
     items = appointments_db.get_shortlist(phone) if phone else []
     if not items:
@@ -333,7 +406,22 @@ class FlexLocationRequest(BaseModel):
 @app.post("/location")
 def location(req: FlexLocationRequest):
     """Location understanding only. Returns needs_clarification yes/no,
-    a clarify_question, and normalized_location."""
+    a clarify_question, and normalized_location.
+
+    Business-hours gate: off hours, this reuses the EXISTING
+    needs_clarification="yes" path (main_condition-loc already routes that
+    to main_question-clarify, which displays @clarify_question) to surface
+    the off-hours notice - no new WATI node needed. The next thing the
+    customer types after that gets re-posted to /location by the flow's own
+    main_webhook-loc2 node; if still off hours, they'll see the short
+    repeat line the same way. See claude.md, "Business hours gating".
+    """
+    phone = _clean_incoming(req.phone)
+    off_hours_text = _off_hours_text(phone)
+    if off_hours_text is not None:
+        return {"needs_clarification": "yes", "clarify_question": off_hours_text,
+                "clarify_options": [], "normalized_location": "", "handoff": "no",
+                "business_hours": "no"}
     return location_handler(LocationRequest(message=req.best() , phone=req.phone))
 
 
@@ -443,6 +531,10 @@ def advisor_request(req: AdvisorRequestRequest):
     if not phone:
         return {"notified": "no", "message": "Couldn't identify your number. An advisor will be in touch shortly."}
 
+    off_hours_text = _off_hours_text(phone)
+    if off_hours_text is not None:
+        return {"notified": "no", "message": off_hours_text, "business_hours": "no"}
+
     if not conversation_lock.acquire(phone):
         return {"notified": "no", "message": "Still processing — please wait a moment."}
 
@@ -537,14 +629,26 @@ def _run_global_intent(intent: dict, req, phone: str) -> dict:
     if kind == "change_location":
         normalized = intent_router.resolve_location_text(intent.get("location_text", ""))
         if not normalized:
+            # IMPORTANT: always include "recommendations" here, even empty,
+            # even though this branch never calls search(). WATI's
+            # {{recommendations}} is a Contact Attribute (persistent per
+            # contact, not reset per turn) - if this contact has NEVER had
+            # it set before, WATI has nothing to substitute and prints the
+            # literal unsubstituted "{{recommendations}}" token straight
+            # into the WhatsApp message instead of leaving it blank. Same
+            # failure mode _clean_incoming() already guards against on the
+            # INBOUND side; this is the outbound mirror of it. Caught live
+            # in production - see claude.md, "Free-text handling" changelog.
             return {"handled": "no", "action": "change_location",
-                    "reply_text": "Sorry, I didn't catch which area you meant."}
+                    "reply_text": "Sorry, I didn't catch which area you meant.",
+                    "recommendations": ""}
 
         # Same lock discipline as one_call_search() - a rapid double-tap or
         # a WATI retry for the same phone must not race two searches.
         if not conversation_lock.acquire(phone):
             return {"handled": "no", "action": "change_location",
-                    "reply_text": "Still working on your last request - one moment."}
+                    "reply_text": "Still working on your last request - one moment.",
+                    "recommendations": ""}
         try:
             # Calls property_core.search() directly (already imported at the
             # top of this file) rather than going through run_pipeline() -
@@ -634,6 +738,12 @@ def interpret_message(req: InterpretMessageRequest):
         except Exception as e:
             print(f"[app] conversation_tracker.touch_user_message failed: {e}")
 
+    off_hours_text = _off_hours_text(phone)
+    if off_hours_text is not None:
+        return {"intent": "none", "is_global": "no", "handled": "no",
+                "action": "off_hours", "reply_text": off_hours_text,
+                "recommendations": "", "business_hours": "no"}
+
     intent = intent_router.classify(text)
     out = _run_global_intent(intent, req, phone)
     out["intent"] = intent.get("intent", "none")
@@ -658,6 +768,11 @@ def available_slots(req: AvailableSlotsRequest):
             conversation_tracker.touch_user_message(phone)
         except Exception as e:
             print(f"[app] conversation_tracker.touch_user_message failed: {e}")
+
+    off_hours_text = _off_hours_text(phone)
+    if off_hours_text is not None:
+        return {"slots_text": off_hours_text, "has_slots": "no", "slot_count": 0,
+                "business_hours": "no"}
 
     if not phone:
         return {
@@ -716,6 +831,16 @@ def book_slot(req: BookSlotRequest):
             conversation_tracker.touch_user_message(phone)
         except Exception as e:
             print(f"[app] conversation_tracker.touch_user_message failed: {e}")
+
+    off_hours_text = _off_hours_text(phone)
+    if off_hours_text is not None:
+        # Booking has real side effects (a calendar event, an advisor
+        # notification) - off hours, we must not create either. Skipping
+        # entirely here, before even parsing `choice`, is deliberate: no
+        # slot should ever be confirmed outside business hours.
+        return {"booked": "no", "message": off_hours_text, "advisor": "",
+                "slot_label": "", "business_hours": "no"}
+
     name = _clean_incoming(req.name)
     appt_type = _clean_incoming(req.appt_type) or "site_visit"
     property_ref = _clean_incoming(req.property_ref)
@@ -959,4 +1084,5 @@ def health():
         "scheduler": scheduler_status,
         "advisors_loaded": len(calendar_service.advisor_emails()),
         "opted_out_count": appointments_db.opted_out_count(),
+        "business_hours": "open" if business_hours.is_business_hours() else "closed",
     }

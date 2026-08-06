@@ -38,6 +38,8 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
+import business_hours
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Reuse the same DB file as appointments so a single Railway volume covers both.
@@ -63,7 +65,14 @@ def _connect() -> sqlite3.Connection:
 
 def _init_table() -> None:
     """Create the conversation_activity table if it does not already exist.
-    Called once at module import — same pattern as appointments_db.py's init_db()."""
+    Called once at module import — same pattern as appointments_db.py's init_db().
+
+    Also migrates in the off_hours_notified_date column (business-hours
+    gating feature) if it's missing from an existing table. SQLite has no
+    'ADD COLUMN IF NOT EXISTS', so this tries the ALTER and swallows the
+    'duplicate column' error on every run after the first - the same
+    lightweight, no-external-migration-tool pattern already used for every
+    other table in this project (CREATE TABLE IF NOT EXISTS on import)."""
     conn = _connect()
     try:
         conn.execute("""
@@ -74,9 +83,17 @@ def _init_table() -> None:
               last_user_message   TEXT,
               followup_due_at     TEXT,
               followup_sent       INTEGER DEFAULT 0,
-              conversation_status TEXT
+              conversation_status TEXT,
+              off_hours_notified_date TEXT
             )
         """)
+        try:
+            conn.execute(
+                "ALTER TABLE conversation_activity ADD COLUMN off_hours_notified_date TEXT"
+            )
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
         conn.commit()
     finally:
         conn.close()
@@ -235,6 +252,68 @@ def close_conversation(phone: str) -> None:
         conn.execute(
             "UPDATE conversation_activity SET conversation_status = 'closed' WHERE lead_phone = ?",
             (phone,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# Business-hours off-hours notice tracking. See business_hours.py and
+# claude.md's "Business hours gating" task section for the full design.
+#
+# Stores the notice date on the SAME conversation_activity row every other
+# piece of per-phone state already lives on - per the design doc's own
+# instruction ("conversation_tracker.py (SQLite) stores the notification
+# flag alongside existing conversation state - no new table required"),
+# this deliberately does NOT get its own table.
+# --------------------------------------------------------------------------
+
+def should_send_off_hours_notice(phone: str) -> bool:
+    """True if this phone has NOT already been sent the off-hours notice
+    today (IST calendar date - see business_hours.today_ist_date). Ensures
+    the notice fires once per off-hours WINDOW per day, not once per
+    off-hours message - a phone that sends five messages at 11 PM gets the
+    notice on the first one only.
+
+    True for a phone with no row at all yet (nothing to compare against -
+    same "nothing stored yet" convention used everywhere else in this
+    file, e.g. touch_user_message's no-op-on-missing-row).
+    """
+    if not phone:
+        return False
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT off_hours_notified_date FROM conversation_activity WHERE lead_phone = ?",
+            (phone,),
+        ).fetchone()
+        if not row:
+            return True
+        return row["off_hours_notified_date"] != business_hours.today_ist_date()
+    finally:
+        conn.close()
+
+
+def mark_off_hours_notified(phone: str) -> None:
+    """Record that this phone was just sent today's off-hours notice.
+    Creates a row if none exists yet (a phone's very first message could
+    land off-hours, before any /search has ever run touch_bot_message for
+    them) - unlike touch_user_message, this must not be a no-op on a
+    missing row, or the notice would re-send on every message from a brand
+    new off-hours contact."""
+    if not phone:
+        return
+    conn = _connect()
+    try:
+        conn.execute(
+            """
+            INSERT INTO conversation_activity (lead_phone, off_hours_notified_date)
+            VALUES (?, ?)
+            ON CONFLICT(lead_phone) DO UPDATE SET
+              off_hours_notified_date = excluded.off_hours_notified_date
+            """,
+            (phone, business_hours.today_ist_date()),
         )
         conn.commit()
     finally:

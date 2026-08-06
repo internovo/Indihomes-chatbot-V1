@@ -239,6 +239,41 @@ class AppGlobalIntentTests(unittest.TestCase):
         resp = self.client.post("/interpret-message", json={})
         self.assertEqual(resp.status_code, 200)
 
+    def test_change_location_unrecognised_area_always_includes_recommendations_key(self):
+        # Regression guard for a real bug caught live in production, AFTER
+        # the routing itself was fixed: "Send Andheri also" (a real area,
+        # just not one we stock) hit change_location's early-exit branch,
+        # which returned reply_text but no "recommendations" key at all.
+        # WATI's {{recommendations}} is a persistent Contact Attribute, not
+        # reset per turn - on a contact that had never had it set before,
+        # WATI printed the literal unsubstituted "{{recommendations}}"
+        # token straight into the WhatsApp message. The key must always be
+        # present (even as "") so WATI always has something real to
+        # substitute. See claude.md, "Free-text handling" changelog.
+        resp = self.client.post("/interpret-message", json={
+            "phone": "919999900103", "message": "Send Andheri also",
+        })
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["intent"], "change_location")
+        self.assertIn("recommendations", body)
+        self.assertEqual(body["recommendations"], "")
+
+    @patch("app.conversation_lock.acquire", return_value=False)
+    def test_change_location_lock_contention_also_includes_recommendations_key(self, _mock_acquire):
+        # Same regression as above, but for the OTHER early-exit in the
+        # change_location branch (a rapid double-tap / concurrent request
+        # for the same phone finds the lock already held). Both early-exits
+        # share the same bug class - easy to fix one and miss the other.
+        resp = self.client.post("/interpret-message", json={
+            "phone": "919999900104", "message": "Send Malad West also",
+        })
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["intent"], "change_location")
+        self.assertIn("recommendations", body)
+        self.assertEqual(body["recommendations"], "")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

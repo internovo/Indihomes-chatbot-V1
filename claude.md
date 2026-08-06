@@ -576,3 +576,351 @@ wasn't backed by a working precedent in your file.
   redeploy the backend so the running server matches what the imported flow
   now expects (`intent` / `is_global` on the `/property-detail` response,
   and the `/interpret-message` endpoint existing at all).
+
+---
+
+# CHANGELOG: two more bugs caught during live WATI testing (post-deploy)
+
+Both of these were found using the ACTUAL production bot on a real phone,
+after the changes above were deployed and imported. Neither was visible
+from code review or the automated test suite alone - both needed a live
+run against the real WATI Contact Attributes to surface. Documenting the
+diagnosis process itself here, not just the fix, since the same class of
+bug (WATI variable-type/syntax mismatches) is likely to recur elsewhere.
+
+## Bug 1: condition nodes compared against `@variable` instead of `{{variable}}`
+
+**Symptom:** "Send Andheri also" was typed at the advisor question. The
+Contact Attributes showed the backend HAD correctly returned
+`intent: "change_location"` and `is_global: "yes"` - but the bot displayed
+the generic fallback message ("Sorry, I didn't quite catch that...") as if
+neither condition had matched.
+
+**Root cause:** WATI has TWO separate variable namespaces that look similar
+but are not interchangeable:
+- **Flow Variables** (shown with an `@` prefix in the picker) - populated by
+  response variables mapped as `type: "ContactInputVariable"`.
+- **Contact Attributes** (shown with a `{{ }}` prefix in the picker) -
+  populated by response variables mapped as `type: "ContactCustomParameter"`.
+
+All THREE new response variables added in the WATI flow update
+(`intent`, `is_global`, `prop_intent`) were mapped as `ContactCustomParameter`
+- i.e. they only exist as `{{intent}}`, `{{is_global}}`, `{{prop_intent}}`.
+But all three new condition nodes were written referencing them as
+`@intent`, `@is_global`, `@prop_intent` - Flow Variables that simply don't
+exist. Every condition silently evaluated false against a nonexistent
+variable, every time, regardless of what the backend actually returned.
+
+The two ALREADY-WORKING condition nodes in the original flow
+(`main_condition-slots` checking `{{has_slots}}`, `main_condition-booked`
+checking `{{booked}}`) were the tell - both correctly used `{{ }}` because
+`has_slots`/`booked` are also `ContactCustomParameter`. The mismatch was a
+copy-paste error against the wrong existing pattern in the flow
+(`main_condition-loc`, which correctly uses `@needs_clarification` because
+`needs_clarification` is mapped as `ContactInputVariable` - a DIFFERENT
+response-variable type with the opposite reference syntax).
+
+**The fix (WATI Builder, no backend change needed):** re-pointed all three
+condition nodes at the correct variable through the picker (not typed by
+hand, to guarantee proper binding - same caution as the existing "webhook
+must be tested once before the mapping binds" note below):
+
+| Condition node | Was | Now |
+|---|---|---|
+| `main_condition-propintent` | `@prop_intent` | `{{prop_intent}}` |
+| `main_condition-intloc` | `@intent` | `{{intent}}` |
+| `main_condition-intglobal` | `@is_global` | `{{is_global}}` |
+
+**Rule going forward, added to the "CRITICAL: WATI's two variable syntaxes"
+section above this changelog - re-read it before adding any new condition
+node:** the reference syntax for a response variable in a Condition node is
+determined by its `responseVariables` `type` in the webhook that produced
+it, NOT by convention or by what "looks right":
+- `type: "ContactCustomParameter"` → reference as `{{name}}` in conditions
+  AND in message templates.
+- `type: "ContactInputVariable"` → reference as `@name` in conditions AND
+  in later webhook request bodies.
+When adding a new webhook response variable, immediately check which type
+it was mapped as before writing the condition node that reads it - don't
+assume `@` just because that's the syntax used inside webhook request
+bodies elsewhere in the flow (a different context with its own rule, see
+the original CRITICAL section above).
+
+## Bug 2: `{{recommendations}}` leaked as a literal, unsubstituted token
+
+**Symptom:** after Bug 1 was fixed, testing continued with "Send Andheri
+also" (Andheri is a real Mumbai area, just not one Indihomes stocks). The
+bot correctly said *"Sorry, I didn't catch which area you meant."* - but
+followed it with a second line reading literally: `{{recommendations}}`.
+
+**Root cause:** `_run_global_intent`'s `change_location` branch has TWO
+early-exit paths that return before ever calling `search()` - one when
+`resolve_location_text()` finds no matching inventory, one when the
+conversation lock can't be acquired. Neither set a `recommendations` key at
+all. `main_message-intshow`'s template is:
+```
+{{reply_text}}
+
+{{recommendations}}
+```
+`{{recommendations}}` is a Contact Attribute - **persistent per contact,
+not reset per conversation turn.** On a contact who had never had that
+attribute set before (no prior successful search), WATI had nothing to
+substitute and printed the literal unsubstituted token straight into the
+WhatsApp message - the exact same failure mode `_clean_incoming()` already
+guards against on the INBOUND side (see the CRITICAL section above), just
+mirrored on the outbound side, which nothing was guarding.
+
+**Scope check - does this affect the original `/search` flow?** No. Every
+return path inside `property_core.search()` unconditionally includes a
+`recommendations` key (checked directly), so `main_message-recommend` (the
+first shortlist a customer ever sees) was never at risk. This bug was
+isolated to the two new early-exits added for the free-text feature, which
+return before `search()` is ever called.
+
+**The fix**, both early-exits in `app.py`'s `_run_global_intent`
+`change_location` branch now explicitly include `"recommendations": ""`:
+```python
+if not normalized:
+    return {"handled": "no", "action": "change_location",
+            "reply_text": "Sorry, I didn't catch which area you meant.",
+            "recommendations": ""}
+...
+if not conversation_lock.acquire(phone):
+    return {"handled": "no", "action": "change_location",
+            "reply_text": "Still working on your last request - one moment.",
+            "recommendations": ""}
+```
+Covered by two new regression tests in `tests/test_intent_router.py`:
+`test_change_location_unrecognised_area_always_includes_recommendations_key`
+and `test_change_location_lock_contention_also_includes_recommendations_key`
+- both assert the key is present (as `""`) even when no search ran.
+
+**Lesson for future intent handlers, added to Bug 1's fix note above:** any
+result dict that can flow into a WATI message template referencing
+MULTIPLE `{{variable}}` placeholders must set EVERY one of those keys on
+EVERY return path through that handler - including early exits - even if
+the value is just `""`. A key that's sometimes present and sometimes
+missing doesn't fail loudly; it silently leaks the raw `{{placeholder}}`
+text to a real customer on whichever paths omit it.
+
+## Diagnosis method worth reusing
+
+Both bugs were found the same way, and it's a repeatable technique for
+future WATI issues: **check the contact's actual Custom Attributes / Flow
+Variables in WATI right after a live message**, not just the bot's visible
+reply. The visible reply only shows what the MESSAGE TEMPLATE did with the
+data; the attribute values show what the BACKEND actually returned. When
+those two disagree (backend clearly returned the right value, bot behaved
+as if it hadn't), the bug is almost always in the WATI-side variable
+reference (wrong syntax, wrong type, or a missing key), not in the backend
+logic - which is exactly what both bugs above turned out to be.
+
+## Deployment status (updated)
+
+- Backend: `app.py` fix for Bug 2 deployed; `tests/test_intent_router.py`
+  has 24 tests total (22 previous + 2 new regression tests for Bug 2), all
+  passing.
+- WATI flow: Bug 1's three condition-node fixes applied directly in
+  Builder (no re-import needed - existing nodes edited in place).
+- **Both bugs confirmed fixed via live WhatsApp test** - "Send Andheri
+  also" now correctly shows only the "didn't catch which area" message
+  with no leaked placeholder text; a real, stocked area (e.g. "Send Malad
+  West also") should be tested next to confirm the full change_location
+  success path (fresh listings + loop back into the property-picker) still
+  works end-to-end after all three fixes.
+
+---
+
+# TASK: Business-hours gating (10 AM - 7 PM IST)
+
+## Source
+
+Implemented from `Indihomes_Business_Hours_Gating.docx` (design doc,
+sections 1-6). Read that document for the full business rationale; this
+section covers what was actually built in THIS project (Phase 1 / Direct
+Website bot) and where it diverges from or interprets an ambiguity in the
+original spec.
+
+**Scope note:** the design doc also covers a Phase 2 Campaign Service
+(Housing.com / Meta Ads leads, §3.3 - persisted pending_queue + 9 AM flush
+job) that lives in a SEPARATE codebase, not this one. Only §3.1 (shared
+utility) and §3.2 (this reactive bot) are implemented here. §3.3 needs the
+same `business_hours.py` file dropped into that other project and its own
+queue/flush-job wiring - ask for that as a separate pass once pointed at
+the right folder.
+
+## What was built
+
+### 1. `business_hours.py` (new)
+
+Exactly the shared utility from the doc's §3.1, plus two small additions
+needed to support the notice-tracking logic below:
+- `is_business_hours(dt=None) -> bool` - 10:00-19:00 IST, inclusive of
+  both endpoints. Always converts to IST first regardless of the caller's
+  timezone (Railway containers run UTC).
+- `today_ist_date(dt=None) -> str` - 'YYYY-MM-DD' in IST, used to gate the
+  once-per-day off-hours notice by IST calendar day, not UTC day (which
+  could flip mid-evening IST and cause a spurious second notice).
+- `next_business_open(dt=None) -> datetime` - not currently called by
+  anything in this project, included because the doc's §3.3 (Phase 2) will
+  need it for queue-flush scheduling; kept here so both codebases can share
+  one file rather than each reinventing it.
+
+Deliberately zero dependencies beyond the stdlib, so this one file can be
+copied as-is into the Phase 2 codebase without pulling this project's
+`requirements.txt` along with it.
+
+### 2. `conversation_tracker.py` - off-hours notice tracking (new)
+
+Per the doc's own instruction (§3.2: "conversation_tracker.py (SQLite)
+stores the notification flag alongside existing conversation state - no
+new table required"), a new column `off_hours_notified_date` was added to
+the existing `conversation_activity` table (migrated in via a safe
+`ALTER TABLE` that swallows the "duplicate column" error on every run
+after the first - same lightweight pattern as every other table's
+`CREATE TABLE IF NOT EXISTS` in this project, no external migration tool).
+
+Two new functions:
+- `should_send_off_hours_notice(phone) -> bool` - True if this phone
+  hasn't been notified yet today (IST calendar date).
+- `mark_off_hours_notified(phone) -> None` - records today's date. Unlike
+  `touch_user_message`, this INSERTs a row if none exists (a phone's very
+  first message could land off-hours, before any `/search` has ever run
+  `touch_bot_message` for them).
+
+### 3. `app.py` - `_off_hours_text()` gate + wired into every customer-facing endpoint
+
+A single shared helper, `_off_hours_text(phone)`, returns `None` if within
+business hours (caller proceeds normally - zero behaviour change for the
+common case) or a string to use as the ENTIRE customer-facing reply if
+we're off hours.
+
+Wired into every endpoint that produces text a customer actually reads:
+`/search`, `/location`, `/property-detail`, `/interpret-message`,
+`/available-slots`, `/book-slot`, `/advisor-request`. Each gate sits at the
+very top of the function, before any real processing - no LLM call, no
+Google Calendar call, no search, ever runs off-hours. Each returns a
+degraded response in that endpoint's OWN normal shape (never a 500),
+plus a `business_hours: "no"` flag for visibility/debugging.
+
+**Deliberately NOT gated:**
+- `/parse-priorities` - pure classification, produces no customer-facing
+  text of its own (its output only feeds WATI's own routing to the next
+  static question).
+- `/save-lead` - a CRM write, not a chat reply. Gating this would delay
+  CRM updates for conversations that are already in progress, which is a
+  data-integrity concern unrelated to "don't send replies at 2 AM" - the
+  doc's stated objective is about REPLIES, not bookkeeping.
+- `/debug-search`, `/debug-location` - developer-only, never customer-facing.
+- The WATI flow's static opening message and button prompts (before the
+  user answers anything) aren't backend calls at all, so there's nothing
+  in THIS codebase to gate there - consistent with the doc's own §2
+  framing ("WATI is used purely as a communication layer").
+
+### 4. `/location`'s gate reuses EXISTING WATI wiring - no flow change needed
+
+Worth calling out specifically: off hours, `/location` returns
+`needs_clarification: "yes"` with the off-hours text as `clarify_question`.
+`main_condition-loc` already routes that straight to `main_question-clarify`,
+which displays `@clarify_question` - so the off-hours notice appears with
+**zero WATI Builder changes**, the same principle used for the
+`/property-detail` fix in "Free-text handling" above. Every other gated
+endpoint also needs no WATI changes, since each just repurposes fields the
+flow already displays (`recommendations`, `detail`, `slots_text`, `message`,
+`reply_text`).
+
+### 5. `/health`
+
+Now reports `business_hours: "open"` or `"closed"`.
+
+## Design deviation, called out explicitly
+
+The doc's §3.2 says: *"repeat messages in the same off-hours window don't
+trigger repeat notices"* - which could be read as implying true silence on
+the 2nd+ off-hours message. **That's not expressible in this endpoint
+shape.** This bot is a synchronous, reactive webhook: WATI blocks waiting
+for a response to every call it makes, and every downstream Message/
+Question node needs SOME text to render - an empty string risks an error
+or a blank chat bubble, not a clean no-op (the doc's proactive-send
+language in §3.3, by contrast, genuinely CAN skip a send outright, since
+that side is not request/response bound).
+
+**What was actually built:** the FIRST off-hours message today gets the
+full notice (`_OFF_HOURS_NOTICE`); every off-hours message after that gets
+a short, DISTINCT line (`_OFF_HOURS_SHORT`, "We're currently closed - back
+at 10 AM IST.") instead of the full paragraph repeating. This satisfies
+the spirit of "no repeat notices" (the same paragraph never shows twice)
+within what a reactive webhook can actually do. If real usage shows this
+is still too chatty (e.g. a lead spamming messages overnight), the fix is
+to revisit this function alone - `_off_hours_text()` is the single choke
+point every gated endpoint calls through.
+
+## Known limitations / things to watch
+
+- **`/book-slot` gates unconditionally**, including for a slot list shown
+  during business hours where the customer's reply lands right at the
+  6:59 PM edge. This mirrors the doc's own §6.2 trade-off ("response
+  latency increases... slightly reduces the instant-response advantage")
+  rather than trying to special-case the edge - the doc explicitly accepts
+  this cost for Phase 2's proactive sends, and the same reasoning applies
+  here.
+- **The off-hours notice text is currently backend-only copy**, not
+  configurable from WATI. If the business wants to edit the wording
+  without a redeploy, `_OFF_HOURS_NOTICE` / `_OFF_HOURS_SHORT` would need
+  to move to an env var or a WATI-side template - not done here since the
+  doc didn't ask for that and it's easy to add later without touching the
+  gating logic itself.
+- **Phase 2 (§3.3) is not implemented in this codebase** - see "Scope
+  note" above.
+
+## Testing
+
+```powershell
+cd C:\Users\admin\Desktop\Indihomes-chatbot-V1
+python -m unittest tests.test_business_hours -v
+```
+
+Covers: `is_business_hours()` boundary times (10:00/19:00 inclusive,
+9:59/19:01 excluded) and timezone conversion; `next_business_open()`;
+`today_ist_date()` including a UTC-day-vs-IST-day rollover case;
+`conversation_tracker`'s notice tracking (fresh phone, idempotent marking,
+empty-phone safety); and, for every gated endpoint, that off-hours (a)
+returns `business_hours: "no"`, (b) never calls the real underlying logic
+(`call_llm`, `calendar_service.get_free_slots`, `calendar_service.create_event`,
+`email_service.send_booking_notification` are all asserted NOT called), and
+(c) that within-hours behaviour is completely unchanged (no `business_hours`
+key appears at all in the normal-hours response). Also confirms the
+first-notice-vs-repeat-notice distinction directly.
+
+Manual, against a running `uvicorn app:app`:
+
+```powershell
+# 1. Health shows current status
+Invoke-RestMethod -Uri "http://localhost:8000/health"
+# Look at the "business_hours" field: "open" or "closed" depending on when you run this.
+
+# 2. Force an off-hours response to inspect the shape (works any time of day -
+#    /debug-search bypasses the gate, so use a gated endpoint directly and
+#    just read whichever field you'd expect the gate to touch; if it's
+#    currently within business hours, this will show NORMAL behaviour -
+#    that's correct, it means the gate is doing nothing when it shouldn't).
+Invoke-RestMethod -Uri "http://localhost:8000/interpret-message" -Method Post `
+  -ContentType "application/json" -Body '{"phone":"919999999995","message":"hello"}'
+# During business hours: intent classified normally, no business_hours key.
+# Outside business hours: business_hours = "no", reply_text = the notice.
+
+# 3. Confirm the once-per-day behaviour (run twice off-hours, same phone)
+Invoke-RestMethod -Uri "http://localhost:8000/interpret-message" -Method Post `
+  -ContentType "application/json" -Body '{"phone":"919999999994","message":"hi"}'
+Invoke-RestMethod -Uri "http://localhost:8000/interpret-message" -Method Post `
+  -ContentType "application/json" -Body '{"phone":"919999999994","message":"hi again"}'
+# Expect: first reply_text is the full notice, second is the short line - different text.
+```
+
+To actually exercise this without waiting for real off-hours, temporarily
+patch the system clock is not practical on a live server - rely on the
+automated tests above (which pass explicit datetimes / mock the gate) for
+boundary correctness, and use the manual checks only to confirm current
+real-time behaviour matches what `/health` reports.
+
