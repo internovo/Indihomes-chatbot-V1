@@ -11,6 +11,8 @@ Also kept for testing / future use:
   POST /location            (location extraction only)
   POST /debug-search        (shows what was parsed - use when something looks wrong)
   POST /api/property-search (search only, expects an already-clean location)
+  POST /interpret-message   (free-text global-intent fallback - see claude.md,
+                            "Free-text handling", and intent_router.py)
   GET  /health
 
 Setup:
@@ -46,6 +48,7 @@ import email_service
 import crm_service
 import conversation_lock
 import conversation_tracker
+import intent_router
 import wati_client
 from models import PriorityParseRequest
 
@@ -198,6 +201,20 @@ def one_call_search(req: SearchRequest):
 class PropertyDetailRequest(BaseModel):
     phone: Optional[str] = ""
     choice: Optional[str] = ""   # the number the user replied with
+    name: Optional[str] = ""
+    # Optional context carried over from the flow's collected attributes, so
+    # a global intent detected here (see claude.md, "Free-text handling")
+    # can act with the full picture - e.g. change_location can re-run search
+    # with the customer's already-stated budget/configuration instead of
+    # just the new area alone. Safe to omit; WATI simply won't send them if
+    # this webhook node isn't updated to forward these attributes.
+    location: Optional[str] = ""
+    configuration: Optional[str] = ""
+    budget: Optional[str] = ""
+    purpose: Optional[str] = ""
+    amenities: Optional[str] = ""
+    builder: Optional[str] = ""
+    possession: Optional[str] = ""
 
 
 @app.post("/property-detail")
@@ -220,8 +237,39 @@ def property_detail(req: PropertyDetailRequest):
 
     idx = _parse_choice(choice, len(items))
     if idx is None:
+        # Not a valid number - before falling back to the generic retry
+        # copy, check whether this is actually a global intent in disguise.
+        # This is the exact production failure documented in claude.md:
+        # "No one" (reject_all) and "Send in borivali east also"
+        # (change_location) were both typed right here, at this node, and
+        # both got the generic "reply 1-3" message instead of a real answer.
+        intent = intent_router.classify(choice)
+        if intent["intent"] != "none":
+            result = _run_global_intent(intent, req, phone)
+            # IMPORTANT: reply_text and recommendations are DIFFERENT fields
+            # and both can be present (change_location sets both - a short
+            # intro line AND the actual listings). Combine them rather than
+            # picking one with `or` - reply_text is always truthy when set,
+            # so an `or` chain here would silently swallow the real property
+            # listings and show only the intro line. Caught by hand-testing
+            # the change_location path before wiring it into WATI - see
+            # claude.md, "Free-text handling", changelog.
+            detail_parts = [p for p in (result.get("reply_text", ""),
+                                         result.get("recommendations", "")) if p]
+            detail_text = "\n\n".join(detail_parts) or \
+                f"Please reply with a number between 1 and {len(items)} to see that property."
+            return {
+                "found": "no",
+                "name": result.get("name1", "") or "",
+                "image_url": "",
+                "code": "",
+                "detail": detail_text,
+                "intent": intent["intent"],
+                "is_global": "yes",
+            }
         return {"found": "no", "name": "", "image_url": "",
-                "detail": f"Please reply with a number between 1 and {len(items)} to see that property."}
+                "detail": f"Please reply with a number between 1 and {len(items)} to see that property.",
+                "intent": "none", "is_global": "no"}
 
     item = items[idx - 1]
     return {
@@ -416,6 +464,181 @@ def advisor_request(req: AdvisorRequestRequest):
         }
     finally:
         conversation_lock.release(phone)
+
+
+# --------------------------------------------------------------------------
+# Global intent handling: free text that doesn't match whatever button/
+# number a WATI node was expecting. See claude.md, "Free-text handling",
+# for the production transcript that motivated this and the required WATI
+# wiring to get full coverage (not just the /property-detail node, which is
+# patched directly above to cover the exact case that was observed live).
+# --------------------------------------------------------------------------
+
+def _run_global_intent(intent: dict, req, phone: str) -> dict:
+    """Executes the side effects for one classified global intent (see
+    intent_router.classify) and returns a flat, WATI-friendly dict.
+
+    Shared by /interpret-message (the general "any node, any time" fallback)
+    and /property-detail's unparseable-choice branch (the specific node
+    where this was actually observed failing in production). `req` may be
+    an InterpretMessageRequest or a PropertyDetailRequest - both carry the
+    same optional slot field names (location, configuration, budget, etc.),
+    accessed defensively with getattr so either shape works and a field
+    missing from one model is never a crash.
+
+    Every branch is best-effort and defensive by the same contract every
+    other endpoint in this file follows: a failure in a side effect (DB
+    write, email, tracker touch) is logged and swallowed, never allowed to
+    turn into a 500 back to WATI mid-conversation.
+    """
+    name = _clean_incoming(getattr(req, "name", "") or "")
+    kind = intent.get("intent", "none")
+
+    if kind == "stop":
+        # Compliance-critical: permanently do-not-contact, independent of
+        # whatever conversation_tracker row exists right now or later.
+        if phone:
+            try:
+                appointments_db.mark_opted_out(phone)
+                conversation_tracker.close_conversation(phone)
+            except Exception as e:
+                print(f"[app] opt-out handling failed: {e}")
+        return {"handled": "yes", "action": "stop",
+                "reply_text": "You won't hear from us again. Take care!"}
+
+    if kind == "talk_to_advisor":
+        # Reuse advisor_request() as-is (locking, email, tracker close all
+        # already handled there) rather than duplicating that logic here.
+        result = advisor_request(AdvisorRequestRequest(phone=phone, name=name))
+        return {"handled": "yes", "action": "talk_to_advisor",
+                "reply_text": result.get("message", "")}
+
+    if kind == "reject_all":
+        # Deliberately does NOT re-run search on its own - "none of these"
+        # doesn't tell us what WOULD fit. Offer the two real next steps and
+        # let the customer's next message (a new area/budget, or "advisor")
+        # drive the actual next action.
+        return {"handled": "yes", "action": "reject_all", "offer_widen": "yes",
+                "reply_text": ("No problem - would you like me to widen the search "
+                                "(a different area or a higher budget), or have an "
+                                "advisor call you instead?")}
+
+    if kind == "restart":
+        if phone:
+            try:
+                appointments_db.clear_pending_slots(phone)
+                appointments_db.clear_pending_clarification(phone)
+                appointments_db.reset_location_retry(phone)
+            except Exception as e:
+                print(f"[app] restart cleanup failed: {e}")
+        return {"handled": "yes", "action": "restart",
+                "reply_text": "Sure, let's start again - which area are you looking in?"}
+
+    if kind == "change_location":
+        normalized = intent_router.resolve_location_text(intent.get("location_text", ""))
+        if not normalized:
+            return {"handled": "no", "action": "change_location",
+                    "reply_text": "Sorry, I didn't catch which area you meant."}
+
+        # Same lock discipline as one_call_search() - a rapid double-tap or
+        # a WATI retry for the same phone must not race two searches.
+        if not conversation_lock.acquire(phone):
+            return {"handled": "no", "action": "change_location",
+                    "reply_text": "Still working on your last request - one moment."}
+        try:
+            # Calls property_core.search() directly (already imported at the
+            # top of this file) rather than going through run_pipeline() -
+            # the location is already normalized/whitelisted here, so a
+            # second Groq round trip on the same text would just be wasted
+            # latency and cost for the same answer.
+            result = search(
+                location="|".join(normalized),
+                configuration=_clean_incoming(getattr(req, "configuration", "")),
+                budget=_clean_incoming(getattr(req, "budget", "")),
+                amenities=_clean_incoming(getattr(req, "amenities", "")),
+                possession=(_clean_incoming(getattr(req, "possession", "")) or
+                            _clean_incoming(getattr(req, "possession_pref", ""))),
+                limit=5,
+            )
+            if phone and result.get("shortlist"):
+                try:
+                    appointments_db.save_shortlist(phone, result["shortlist"])
+                except Exception as e:
+                    print(f"[app] could not save shortlist (global intent): {e}")
+            if phone and result.get("count"):
+                try:
+                    conversation_tracker.touch_bot_message(phone, name)
+                except Exception as e:
+                    print(f"[app] conversation_tracker.touch_bot_message failed: {e}")
+        finally:
+            conversation_lock.release(phone)
+
+        result["handled"] = "yes"
+        result["action"] = "change_location"
+        result["resolved_location"] = "|".join(normalized)
+        result["reply_text"] = "Sure — here's what's available there:"
+        return result
+
+    return {"handled": "no", "action": "none", "reply_text": ""}
+
+
+class InterpretMessageRequest(BaseModel):
+    """Body for POST /interpret-message - the generic fallback endpoint.
+    Wire this to WATI's catch-all / "no match" node so free text typed at
+    ANY point in the flow gets a chance at a real response instead of a dead
+    end. See claude.md, "Free-text handling", for the WATI-side wiring this
+    requires (it is a separate node from the per-question webhooks, so it
+    needs its own edge from the flow's fallback path).
+
+    Every slot field mirrors SearchRequest and is OPTIONAL - WATI should
+    forward whatever custom attributes it has collected so far (they persist
+    across the whole conversation as Custom Attributes), so a change_location
+    intent can re-run search with the customer's existing budget/
+    configuration/etc. instead of starting from nothing.
+    """
+    phone: Optional[str] = ""
+    name: Optional[str] = ""
+    message: Optional[str] = ""
+    location: Optional[str] = ""
+    location_text: Optional[str] = ""
+    configuration: Optional[str] = ""
+    budget: Optional[str] = ""
+    purpose: Optional[str] = ""
+    amenities: Optional[str] = ""
+    builder: Optional[str] = ""
+    builder_pref: Optional[str] = ""
+    possession: Optional[str] = ""
+    possession_pref: Optional[str] = ""
+
+
+@app.post("/interpret-message")
+def interpret_message(req: InterpretMessageRequest):
+    """Classifies free text for a global intent (see intent_router.py) and
+    acts on it if one is found. Point WATI's fallback/"no match" node at
+    this endpoint so a customer typing something the button graph didn't
+    expect - anywhere in the conversation - gets routed to a real response
+    (widen the search, connect an advisor, change area, restart, opt out)
+    instead of a dead end or a repeated "I didn't understand" loop.
+
+    Returns `is_global: "yes"/"no"` so a WATI Condition node can decide
+    whether to use `reply_text` (and, for change_location, the usual
+    @recommendations / @count / @name1.. fields) or fall through to
+    whatever local retry copy that node already had.
+    """
+    phone = _clean_incoming(req.phone)
+    text = _clean_incoming(req.message)
+
+    if phone:
+        try:
+            conversation_tracker.touch_user_message(phone)
+        except Exception as e:
+            print(f"[app] conversation_tracker.touch_user_message failed: {e}")
+
+    intent = intent_router.classify(text)
+    out = _run_global_intent(intent, req, phone)
+    out["intent"] = intent.get("intent", "none")
+    out["is_global"] = "yes" if intent.get("intent", "none") != "none" else "no"
+    return out
 
 
 class AvailableSlotsRequest(BaseModel):
@@ -735,4 +958,5 @@ def health():
         "wati": wati_status,
         "scheduler": scheduler_status,
         "advisors_loaded": len(calendar_service.advisor_emails()),
+        "opted_out_count": appointments_db.opted_out_count(),
     }

@@ -37,6 +37,7 @@ the return value.
 
 import logging
 
+import appointments_db
 import conversation_lock
 import conversation_tracker
 import wati_client
@@ -80,6 +81,18 @@ def run_followup_sweep() -> None:
         name = row.get("lead_name", "") or ""
 
         if not phone:
+            continue
+
+        # Do-not-contact check FIRST, before acquiring the lock or touching
+        # WATI at all - a phone that sent "stop" (see intent_router.py) must
+        # never receive another proactive message, no matter what triggered
+        # this sweep row. Close the row so it also stops reappearing here.
+        if appointments_db.is_opted_out(phone):
+            logger.info("[followup_scheduler] %s opted out - closing without sending", phone)
+            try:
+                conversation_tracker.close_conversation(phone)
+            except Exception as e:
+                logger.error("[followup_scheduler] could not close opted-out conversation %s: %s", phone, e)
             continue
 
         # Acquire the conversation lock before touching this phone.

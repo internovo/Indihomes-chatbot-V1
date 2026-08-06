@@ -77,6 +77,12 @@ def init_db():
               updated_at TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS opted_out (
+              lead_phone   TEXT PRIMARY KEY,
+              opted_out_at TEXT
+            )
+        """)
         conn.commit()
     finally:
         conn.close()
@@ -277,5 +283,61 @@ def next_advisor(advisor_emails: List[str]) -> Optional[str]:
         ).fetchone()
         count = row["n"] if row else 0
         return advisor_emails[count % len(advisor_emails)]
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# Opt-out (do-not-contact). Added alongside intent_router.py's "stop" global
+# intent - see claude.md, "Free-text handling".
+#
+# Deliberately a SEPARATE, permanent flag from conversation_tracker's
+# 'closed' status. conversation_activity.conversation_status='closed' only
+# stops the one 2-hour follow-up nudge for the CURRENT conversation; a fresh
+# /search call re-opens a new row for the same phone (see touch_bot_message)
+# and follow-ups would start again next time they engage. opted_out is a
+# standing do-not-contact flag any CURRENT or FUTURE proactive send (the
+# follow-up scheduler today; anything else that messages a phone first,
+# later) must check regardless of conversation state.
+# --------------------------------------------------------------------------
+
+def mark_opted_out(phone: str) -> None:
+    """Record that this phone asked not to be messaged again. Idempotent -
+    a second 'stop' just keeps the original timestamp."""
+    if not phone:
+        return
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT INTO opted_out (lead_phone, opted_out_at) VALUES (?, ?) "
+            "ON CONFLICT(lead_phone) DO NOTHING",
+            (phone, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def is_opted_out(phone: str) -> bool:
+    """True if this phone has ever sent a 'stop' intent. Checked by
+    followup_scheduler before every proactive send."""
+    if not phone:
+        return False
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM opted_out WHERE lead_phone = ?", (phone,)
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def opted_out_count() -> int:
+    """Used by /health - a quick visibility signal, nothing more."""
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT COUNT(*) AS n FROM opted_out").fetchone()
+        return row["n"] if row else 0
     finally:
         conn.close()
