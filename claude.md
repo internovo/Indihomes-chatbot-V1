@@ -924,3 +924,279 @@ automated tests above (which pass explicit datetimes / mock the gate) for
 boundary correctness, and use the manual checks only to confirm current
 real-time behaviour matches what `/health` reports.
 
+---
+
+# CHANGELOG: burst-message location bug (production, Hitesh transcript)
+
+## The transcript
+
+```
+[21:37:17] Hitesh: Malad
+[21:37:18] Hitesh: Goregaon        <- sent 1 second later
+[21:37:19] Bot: Just to narrow it down - Malad East or Malad West?
+[21:37:20] Hitesh: Other Area
+```
+
+Two distinct failures in one short exchange:
+
+1. "Goregaon" was sent while the bot was still processing "Malad" - by the
+   time the webhook for "Malad" returned and the flow advanced to the
+   "Malad East or Malad West?" clarify question, "Goregaon" landed as the
+   REPLY to that question instead of a fresh message. It doesn't match
+   either offered candidate.
+2. Confused, Hitesh then typed/tapped "Other Area" - the MENU LABEL from
+   the very first area-selection buttons node, not a real place name -
+   which also lands on the same stale clarify question.
+
+This is the exact message-burst race flagged as a risk much earlier in
+this project (see "Free-text handling", above): *"She could just as
+easily have sent 'Thane' then 'mulund' two seconds apart... buffer inbound
+messages, or you'll classify half a thought."* True server-side debouncing
+turned out to be the wrong fix once actually reasoned through (see below) -
+this is the fix that was built instead.
+
+## Why debouncing the HTTP response is NOT the fix
+
+The instinctive fix - hold the first webhook's response open for ~2
+seconds to see if a second message arrives, then process both together -
+was considered and rejected. `/location` is a SYNCHRONOUS webhook: WATI
+blocks waiting for a response to every call it makes, and the flow only
+becomes ready to accept the customer's NEXT message once it has that
+response and has advanced to the next node. Holding the first response
+open doesn't give the second message anywhere to arrive sooner - if
+anything it delays the flow from being ready to receive it. The race
+can't be prevented at the transport layer from this backend; the fix has
+to make the backend robust to WHICHEVER message wins the race, not try to
+reorder them.
+
+## What was actually built, both in `llm_location.py`'s `location()`
+
+### Fix 1 - the "Other Area" sentinel
+
+If `raw.strip().lower()` is `"other area"` or `"other"` while a
+clarification is pending, that's recognised explicitly: clear the stale
+clarification, ask a fresh open question ("Sure - which area are you
+looking in?"), and - important - call `reset_location_retry()`, not
+`increment_location_retry()`. This is the customer asking to redo the
+question, not a failure to understand them, so it must not count toward
+the 3-attempt handoff threshold. Checked BEFORE burning an LLM call on
+obvious non-location text.
+
+### Fix 2 - the fresh-location override
+
+When a reply doesn't match the offered candidates AND isn't the "other
+area" sentinel, `location()` now checks - deterministically, no LLM call -
+whether the raw reply is itself a real, known area on its own, via the
+SAME `normalize_location()` whitelist `_resolve()` already trusts:
+
+```python
+if match is None and raw:
+    override = normalize_location(raw.strip())
+    if override:
+        appointments_db.reset_location_retry(phone)
+        if len(override) == 1:
+            # unambiguous - resolve immediately
+            ...
+        else:
+            # still ambiguous, but a DIFFERENT ambiguity than what was
+            # pending (e.g. Goregaon E/W instead of Malad E/W) - replace
+            # the stale clarification with this new one
+            ...
+```
+
+For Hitesh's exact case: "Goregaon" doesn't match "Malad East"/"Malad
+West", but `normalize_location("Goregaon")` returns `["Goregaon East",
+"Goregaon West"]` (a whitelisted, real result via `SPLIT_RULES`) - so
+instead of silently failing or looping the now-irrelevant Malad question,
+the bot asks a FRESH, correct clarification: "Just to narrow it down -
+Goregaon East or Goregaon West?"
+
+**Why this doesn't need the LLM:** `normalize_location()` is a pure
+lookup against `SPLIT_RULES` + the real inventory whitelist
+(`KNOWN_LOCALITIES_LOWER`) - same trust boundary `_resolve()` already
+relies on for the primary path. A non-empty result is as trustworthy as
+any other normalized location in this codebase, and it's instant/free
+instead of a network round trip.
+
+**What's still NOT fixed, honestly:** if WATI genuinely never delivers a
+rapid second message to this backend at all (dropped client-side before
+ever calling the webhook), no backend code can recover it - that failure
+mode, if it exists, is outside what `llm_location.py` can control. This
+fix only guarantees that WHICHEVER message the backend DOES receive gets
+interpreted sensibly, not that every burst message is guaranteed to
+arrive.
+
+## Testing
+
+```powershell
+cd C:\Users\admin\Desktop\Indihomes-chatbot-V1
+python -m unittest tests.test_location_burst -v
+```
+
+Covers both fixes directly (seeding pending-clarification state via
+`appointments_db`, same technique as the existing
+`tests/test_pending_clarification_live.py`, so no GROQ_API_KEY or network
+is needed - both fixed paths return before `call_llm()` is ever reached):
+the "Other Area" sentinel (case-insensitivity, retry-counter reset,
+no-pending-state no-op); the fresh-location override (unrelated known area
+replacing a stale clarification, an unambiguous override resolving
+immediately, a real answer to the actual question still winning over the
+override, and unrecognisable text still falling through to the LLM path
+unchanged - a regression guard that this fix doesn't change behaviour for
+genuinely unclear input).
+
+---
+
+# CHANGELOG: Lead-safety-net - fallback wiring on every button node + needs_human logging
+
+## What was found
+
+A production transcript (Hitesh Tailor, sent to the team outside business
+hours) showed a lead going cold after typing "Other Area" at the area
+picker. Investigating it turned up two separate things, only one of which
+was actually still broken:
+
+1. **Already fixed** - the exact mechanism in that transcript (a burst of
+   messages landing on a stale `main_question-clarify` question) was
+   root-caused and patched in `llm_location.py` - see the "burst-message
+   location bug" changelog above this one. No further action needed there.
+2. **Still broken** - every `InteractiveButtons` node in the flow EXCEPT
+   `main_buttons-next` had an empty `interactiveButtonsDefaultNodeResultId`.
+   Free text or an unmatched tap at `consent`, `config`, `budget`, `flex`,
+   `purpose`, `priority`, `possession`, `wFpLC` (loan follow-up), `aIINr`
+   (area picker, as defence-in-depth alongside fix #1 above), or `RRfox`
+   (closing loan menu) had nowhere to go.
+3. **A silent gap even where the fallback DID exist** - `_run_global_intent`'s
+   final branch, reached whenever `intent_router.classify()` returns
+   `"none"`, returned `{"handled": "no", "action": "none", "reply_text": ""}`
+   and did nothing else. The customer still saw a real message (WATI's
+   `is_global=="no"` branch shows static local copy, not this empty
+   `reply_text` - see `main_message-intfallback`), but nothing was ever
+   logged. A lead that hit this looked, in the CRM, indistinguishable from
+   one who simply never replied.
+
+## What was built
+
+### 1. `appointments_db.py` - `needs_human` table (new)
+
+`mark_needs_human(phone, name, flow_step, raw_message)`,
+`needs_human_count()`, `list_needs_human(unnotified_only, limit)`,
+`mark_needs_human_notified(ids)`. Deliberately separate from `opted_out`
+and from `conversation_tracker`'s follow-up timer - this is a worklist for
+a human to look at BECAUSE the bot couldn't help, not a contact-preference
+flag. A phone can appear more than once; repetition is itself a signal.
+
+### 2. `app.py` - `_run_global_intent`'s `"none"` branch (patched)
+
+Now calls `appointments_db.mark_needs_human()` best-effort (same
+try/except/log-and-swallow contract as every other side effect in this
+function) before falling through to the existing return. `reply_text`
+itself is left as `""` on purpose - both call sites (`/interpret-message`
+and `/property-detail`) already have real, non-blank local copy for
+`is_global=="no"`; this branch's only job is the logging side effect.
+
+`InterpretMessageRequest` gained an optional `flow_step` field so each
+WATI node's fallback webhook can tag which node it came from (e.g.
+`"budget"`, `"location_selection"`). Falls back to `"property_picker"`
+when absent, since `/property-detail`'s call site pre-dates this field.
+
+### 3. `GET /needs-human-leads` + `POST /needs-human-leads/ack` (new)
+
+An advisor-facing worklist endpoint. `GET` returns unnotified rows newest
+first (`include_notified=true` to see everything); `POST .../ack` marks
+given ids notified so they stop resurfacing. No auth added - same trust
+boundary as every other endpoint in this file (see the function's own
+docstring for the caveat before exposing this publicly).
+
+`/health` now also reports `needs_human_count`.
+
+### 4. WATI flow - `Indihomes-main_v2_lead-safety-net.json` (new export)
+
+Every previously-empty-default button node now points at a dedicated
+webhook node (`main_webhook-fb-*`) calling the EXISTING `/interpret-message`
+endpoint - not a new one - each with a hardcoded, distinct `flow_step` in
+its body. All ten (including `main_buttons-next`'s pre-existing one) funnel
+into a shared `main_condition-fb-global` → `{{is_global}}=="yes"` branches
+to `main_message-fb-ack` (shows `{{reply_text}}`, i.e. a real global intent
+fired - stop/talk_to_advisor/reject_all/restart/change_location), the
+`"no"` branch to a generic `main_message-fb-fallback` acknowledgment.
+
+**Deliberately terminal, not looped back into the flow.** Unlike
+`main_buttons-next` (which loops back to itself), these nine nodes sit at
+different qualification stages with no single correct "resume" point.
+Falling to a human via the `needs_human` queue is the safe default here.
+One known limitation this implies: a `restart` intent fired from these
+nodes gets its DB state cleared (per `_run_global_intent`) but the WATI
+conversation position itself doesn't rewind - acceptable since an advisor
+picks it up from the queue, not worth the added graph complexity to fix
+for v1.
+
+**Also fixed in this export**: the exported JSON on disk still had
+`@intent`/`@is_global`/`@prop_intent` in three condition nodes
+(`main_condition-intloc`, `main_condition-intglobal`,
+`main_condition-propintent`), even though the "two more bugs caught during
+live WATI testing" changelog above documents these were already corrected
+to `{{...}}` directly in Builder. Re-exporting from a point before that
+live fix and re-importing it would have silently REGRESSED a bug already
+fixed in production. Corrected in the new export so this doesn't happen.
+
+## Testing
+
+```powershell
+cd C:\Users\admin\Desktop\Indihomes-chatbot-V1
+python -m unittest tests.test_intent_router -v
+```
+
+Four new tests added to the existing `AppGlobalIntentTests` class:
+`test_none_intent_logs_needs_human_with_flow_step`,
+`test_none_intent_without_flow_step_defaults_sensibly`,
+`test_needs_human_leads_endpoint_lists_and_acks`, and
+`test_recognised_intent_does_not_log_needs_human` (a real global intent
+must NOT also create a needs_human row).
+
+Manual, against a running `uvicorn app:app`:
+
+```powershell
+# 1. Health shows the new field
+Invoke-RestMethod -Uri "http://localhost:8000/health"
+# Look for needs_human_count.
+
+# 2. Reproduce an unclassifiable reply at a flow_step and see it logged
+Invoke-RestMethod -Uri "http://localhost:8000/interpret-message" -Method Post `
+  -ContentType "application/json" -Body '{"phone":"919999911111","message":"asdkjfh","flow_step":"budget","name":"Test Lead"}'
+Invoke-RestMethod -Uri "http://localhost:8000/needs-human-leads"
+# Expect: one row, flow_step="budget", raw_message="asdkjfh".
+
+# 3. Ack it and confirm it disappears from the default (unnotified) view
+Invoke-RestMethod -Uri "http://localhost:8000/needs-human-leads/ack" -Method Post `
+  -ContentType "application/json" -Body '{"ids":[1]}'
+Invoke-RestMethod -Uri "http://localhost:8000/needs-human-leads"
+# Expect: that row gone; still visible with ?include_notified=true.
+```
+
+Before going live: import `Indihomes-main_v2_lead-safety-net.json` into
+WATI Builder, then visually confirm each of the nine new default paths
+actually draws a connecting line to its `main_webhook-fb-*` node (same
+caution as the original `main_buttons-next` import - default/no-match
+edges have no working precedent to copy from before this change, so treat
+the first import as unverified until checked in the Builder UI). Also
+confirm the three condition-node variable fixes landed (`{{prop_intent}}`,
+`{{intent}}`, `{{is_global}}`) - if they show as `@`-prefixed after import,
+re-point them through the picker as described in the Bug 1 fix above.
+
+## Known limitations
+
+- **Question-type free-text nodes** (`main_question-wYPyQ`,
+  `main_question-jzbHS`, `main_question-GLNoN`, `main_question-clarify`,
+  `main_question-slotpick`, `main_question-sKKYv`) still have no equivalent
+  fallback for what happens after their native 3-attempt retry is
+  exhausted - WATI's schema doesn't expose a routable "max fails" edge for
+  Question nodes the way it does a default for Buttons nodes. Closing this
+  gap needs a backend-side idle-session watchdog (a scheduled job that
+  detects a lead who stopped mid-question with no reply for N minutes),
+  which belongs in Phase 2's polling infrastructure, not this reactive
+  webhook backend - not built as part of this change.
+- **`needs-human-leads` endpoints are unauthenticated** - fine behind the
+  current private backend URL, but should get auth before any
+  advisor-facing dashboard calls them from outside that trust boundary.
+

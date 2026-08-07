@@ -490,6 +490,32 @@ def location(req: "LocationRequest") -> dict:
 
     match = None
     if pending:
+        # "Other Area" / "Other" is a MENU LABEL from the very first
+        # area-selection buttons node, not a real place name. If it
+        # reaches here - a customer typing/tapping it while a
+        # clarification is pending, e.g. because an earlier burst
+        # message raced the flow (see the fresh-override branch below
+        # and claude.md, "Burst messages / location debounce", for the
+        # production transcript that motivated both fixes) - sending it
+        # into the LLM as raw location text would just waste a call and
+        # likely produce nonsense. Recognise it explicitly: clear the
+        # stale clarification and ask a fresh, open question, WITHOUT
+        # counting it against the retry-then-handoff counter (this is
+        # the customer asking to redo the question, not a failure to
+        # understand them).
+        if raw.strip().lower() in ("other area", "other"):
+            appointments_db.clear_pending_clarification(phone)
+            appointments_db.reset_location_retry(phone)
+            payload = {
+                "needs_clarification": "yes",
+                "clarify_question": "Sure - which area are you looking in?",
+                "clarify_options": [],
+                "normalized_location": "",
+                "handoff": "no",
+            }
+            payload.update(_debug_fields(phone, pending, "other_area_sentinel"))
+            return _enrich_with_search(payload, req)
+
         match = _resolve_pending_reply(raw, pending)
         print(f"[llm_location] _resolve_pending_reply(raw={raw!r}, candidates={pending!r}) -> {match!r}")
         if match:
@@ -507,6 +533,51 @@ def location(req: "LocationRequest") -> dict:
                 payload.update(_debug_fields(phone, pending, match))
                 return _enrich_with_search(payload, req)
             match = None  # normalize_location rejected it - treat as unmatched
+
+        # Nothing matched the OFFERED candidates. Before spending a full
+        # LLM round trip, check deterministically whether the reply is
+        # itself a recognizable, real area on its own - e.g. the
+        # customer answered "Malad East or Malad West?" with "Goregaon"
+        # instead, because a burst of rapid messages raced each other and
+        # this text was actually meant as the reply to an EARLIER,
+        # already-answered question (confirmed in production - see
+        # claude.md, "Burst messages / location debounce", for the exact
+        # transcript this fixes). normalize_location() only ever returns
+        # whitelisted KNOWN_LOCALITIES values, so a non-empty result here
+        # is trustworthy without needing the LLM to confirm it - and it's
+        # instant + free instead of a network round trip.
+        if match is None and raw:
+            override = normalize_location(raw.strip())
+            if override:
+                appointments_db.reset_location_retry(phone)
+                if len(override) == 1:
+                    appointments_db.clear_pending_clarification(phone)
+                    payload = {
+                        "needs_clarification": "no",
+                        "clarify_question": "",
+                        "clarify_options": [],
+                        "normalized_location": "|".join(override),
+                        "handoff": "no",
+                    }
+                    payload.update(_debug_fields(phone, pending, f"fresh_override:{override}"))
+                    return _enrich_with_search(payload, req)
+                # Still ambiguous, but a DIFFERENT ambiguity than what was
+                # pending (e.g. "Goregaon" instead of "Malad") - replace
+                # the stale pending clarification with this new one rather
+                # than looping the old, now-irrelevant question.
+                opts_list = override[:3]
+                appointments_db.save_pending_clarification(phone, opts_list)
+                opts = " or ".join(opts_list)
+                payload = {
+                    "needs_clarification": "yes",
+                    "clarify_question": f"Sure - just to narrow it down, {opts}?",
+                    "clarify_options": opts_list,
+                    "normalized_location": "",
+                    "handoff": "no",
+                }
+                payload.update(_debug_fields(phone, pending, f"fresh_override_ambiguous:{override}"))
+                return _enrich_with_search(payload, req)
+
         # Nothing usable matched locally - fall through to the LLM below.
         # Leave the pending candidates in place so a second guess this turn
         # can still be checked against the same set.

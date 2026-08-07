@@ -83,6 +83,17 @@ def init_db():
               opted_out_at TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS needs_human (
+              id           INTEGER PRIMARY KEY AUTOINCREMENT,
+              lead_phone   TEXT,
+              lead_name    TEXT,
+              flow_step    TEXT,
+              raw_message  TEXT,
+              notified     INTEGER,
+              created_at   TEXT
+            )
+        """)
         conn.commit()
     finally:
         conn.close()
@@ -339,5 +350,83 @@ def opted_out_count() -> int:
     try:
         row = conn.execute("SELECT COUNT(*) AS n FROM opted_out").fetchone()
         return row["n"] if row else 0
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# NEEDS_HUMAN: a lead hit a dead end the button graph + intent_router.py
+# couldn't resolve (intent classified as "none") - the exact class of bug
+# behind the Hitesh transcript (Malad/Goregaon/"Other Area" at the area-
+# picker) and its siblings at every OTHER InteractiveButtons node in the
+# flow, all of which previously had an empty interactiveButtonsDefaultNodeResultId
+# (see claude.md, "Lead-safety-net: fallback wiring on every button node").
+#
+# This table is deliberately separate from opted_out and from
+# conversation_tracker's follow-up timer: it isn't about whether to message
+# the lead again, it's a worklist for a human to look at BECAUSE the bot
+# couldn't help. A phone can appear here more than once (each dead end is
+# its own row) - that repetition is itself a useful signal (a lead who hit
+# this three times needs a human more urgently than one who hit it once).
+# --------------------------------------------------------------------------
+
+def mark_needs_human(phone: str, name: str, flow_step: str, raw_message: str) -> None:
+    """Logs one unresolved free-text dead end for advisor follow-up.
+    Best-effort by the same contract as every other DB write in this file -
+    callers should wrap this in try/except and never let a logging failure
+    break the customer's reply (see app.py's _run_global_intent)."""
+    if not phone:
+        return
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT INTO needs_human (lead_phone, lead_name, flow_step, raw_message, notified, created_at) "
+            "VALUES (?, ?, ?, ?, 0, ?)",
+            (phone, name or "", flow_step or "unknown_step", raw_message or "", datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def needs_human_count() -> int:
+    """Used by /health - visibility into how often the fallback net is
+    actually catching something, mirroring opted_out_count() above."""
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT COUNT(*) AS n FROM needs_human").fetchone()
+        return row["n"] if row else 0
+    finally:
+        conn.close()
+
+
+def list_needs_human(unnotified_only: bool = True, limit: int = 100) -> List[Dict]:
+    """Returns needs_human rows, newest first. Used by GET /needs-human-leads
+    (an advisor-facing queue view, and the endpoint Phase 2's
+    needs_human polling can eventually be pointed at - see that project's
+    claude.md). `unnotified_only=True` (the default) hides rows already
+    marked notified so repeat polls don't keep re-surfacing the same lead."""
+    conn = _connect()
+    try:
+        query = "SELECT id, lead_phone, lead_name, flow_step, raw_message, notified, created_at FROM needs_human"
+        if unnotified_only:
+            query += " WHERE notified = 0"
+        query += " ORDER BY id DESC LIMIT ?"
+        rows = conn.execute(query, (limit,)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def mark_needs_human_notified(ids: List[int]) -> None:
+    """Marks the given needs_human rows as notified, so a future
+    list_needs_human(unnotified_only=True) call doesn't resurface them."""
+    if not ids:
+        return
+    conn = _connect()
+    try:
+        placeholders = ",".join("?" * len(ids))
+        conn.execute(f"UPDATE needs_human SET notified = 1 WHERE id IN ({placeholders})", ids)
+        conn.commit()
     finally:
         conn.close()

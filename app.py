@@ -626,6 +626,38 @@ def _run_global_intent(intent: dict, req, phone: str) -> dict:
         return {"handled": "yes", "action": "restart",
                 "reply_text": "Sure, let's start again - which area are you looking in?"}
 
+    if kind == "none":
+        # Genuinely unrecognized free text at some button/question node that
+        # has no dedicated path for it - the exact class of bug behind the
+        # Hitesh transcript (Malad/Goregaon/"Other Area" at the area picker)
+        # and its siblings at every OTHER InteractiveButtons node in the
+        # flow. Previously this fell all the way through to the final
+        # `return {"handled": "no", "action": "none", "reply_text": ""}`
+        # at the bottom of this function - WATI's own is_global=="no" branch
+        # already shows a real static "please tap a button" message rather
+        # than this empty reply_text (see main_message-intfallback in the
+        # flow), so the customer was never shown a blank bubble - but
+        # NOTHING was ever logged anywhere. The lead just silently sat
+        # there, indistinguishable in the CRM from someone who simply never
+        # replied. See claude.md, "Lead-safety-net", for the full writeup.
+        #
+        # flow_step identifies WHERE this happened, so an advisor opening
+        # the queue sees e.g. "budget" or "location_selection", not just a
+        # phone number - see appointments_db.mark_needs_human. Callers set
+        # this per node (InterpretMessageRequest.flow_step); /property-detail
+        # always means the same node, so it passes a fixed value.
+        flow_step = _clean_incoming(getattr(req, "flow_step", "") or "") or "property_picker"
+        raw_text = _clean_incoming(getattr(req, "message", "") or getattr(req, "choice", "") or "")
+        if phone:
+            try:
+                appointments_db.mark_needs_human(phone, name, flow_step, raw_text)
+            except Exception as e:
+                print(f"[app] mark_needs_human failed: {e}")
+        # reply_text left as-is below (empty) - is_global="no" callers
+        # (both /interpret-message and /property-detail) already fall
+        # through to their own real, non-blank local copy and must keep
+        # doing so; this branch's only job is the logging side effect above.
+
     if kind == "change_location":
         normalized = intent_router.resolve_location_text(intent.get("location_text", ""))
         if not normalized:
@@ -713,6 +745,15 @@ class InterpretMessageRequest(BaseModel):
     builder_pref: Optional[str] = ""
     possession: Optional[str] = ""
     possession_pref: Optional[str] = ""
+    # Which WATI node's default/no-match path called this. Set to a
+    # distinct hardcoded value in each button node's webhook body (e.g.
+    # "budget", "location_selection", "consent") - see
+    # Indihomes-main_updated.json and claude.md, "Lead-safety-net". Purely
+    # for the needs_human log (appointments_db.mark_needs_human); has no
+    # effect on intent classification or routing. Falls back to
+    # "property_picker" if omitted, since that's the one call site
+    # (/property-detail) that pre-dates this field.
+    flow_step: Optional[str] = ""
 
 
 @app.post("/interpret-message")
@@ -1065,6 +1106,38 @@ def _save_lead_locked(req: SaveLeadRequest, phone: str):
     }
 
 
+@app.get("/needs-human-leads")
+def needs_human_leads(limit: int = 100, include_notified: bool = False):
+    """Advisor-facing worklist: every unresolved free-text dead end
+    (see appointments_db.mark_needs_human / _run_global_intent's "none"
+    branch above), newest first. `include_notified=false` (the default)
+    hides rows already acknowledged via /needs-human-leads/ack, so a
+    dashboard or Phase 2 poller only ever sees what's actually new.
+
+    Deliberately unauthenticated for now, same trust boundary as every
+    other endpoint in this file (all are behind the same private backend
+    URL WATI/Phase 2 call) - add auth before exposing this publicly."""
+    rows = appointments_db.list_needs_human(unnotified_only=not include_notified, limit=limit)
+    return {"count": len(rows), "leads": rows}
+
+
+class AckNeedsHumanRequest(BaseModel):
+    ids: list = []
+
+
+@app.post("/needs-human-leads/ack")
+def ack_needs_human_leads(req: AckNeedsHumanRequest):
+    """Marks the given needs_human row ids as notified/handled - called by
+    whatever advisor tool (or Phase 2's polling worker) just surfaced them,
+    so the next /needs-human-leads call doesn't show the same rows again."""
+    try:
+        ids = [int(i) for i in (req.ids or [])]
+    except (TypeError, ValueError):
+        return {"acked": "no", "message": "ids must be a list of integers"}
+    appointments_db.mark_needs_human_notified(ids)
+    return {"acked": "yes", "count": len(ids)}
+
+
 @app.get("/health")
 def health():
     groq = os.environ.get("GROQ_API_KEY") or ""
@@ -1084,5 +1157,6 @@ def health():
         "scheduler": scheduler_status,
         "advisors_loaded": len(calendar_service.advisor_emails()),
         "opted_out_count": appointments_db.opted_out_count(),
+        "needs_human_count": appointments_db.needs_human_count(),
         "business_hours": "open" if business_hours.is_business_hours() else "closed",
     }

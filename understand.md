@@ -1,0 +1,414 @@
+# understand.md — Phase 1 (the reactive WhatsApp bot)
+
+> **Read this like a whiteboard session, not a reference manual.** It builds
+> up from the problem, one idea at a time. By the end you should be able to
+> defend every design decision in this codebase in a production review.
+> Companion file: `../Indiihomes-chatbot-phase2/understand.md` (the other
+> half of the system). And `claude.md` in this same folder is the running
+> changelog of *decisions* — this file is the mental model behind them.
+
+---
+
+## 1. What problem are we actually solving?
+
+A real scene. Megha visits Indihomes, opens WhatsApp, and messages the
+Indihomes number: *"Hi, I'm interested."* She wants a 2 BHK in Kandivali
+East, budget ₹1–2 Cr.
+
+The **painful manual version**: a salesperson has to be awake and at their
+phone, ask her the same 8 questions every lead gets asked (area? budget?
+BHK? own-use or investment?), look up matching projects in a spreadsheet,
+type them out, and book a site visit — for every single lead, at any hour.
+
+What we're building automates that qualification conversation: it asks the
+questions, understands the answers (even when she types instead of tapping
+a button), pulls matching live inventory, shows her properties, books a
+site visit on a real calendar, and hands a warm lead to a human advisor —
+without a human being awake for step one.
+
+---
+
+## 2. The single most important idea in the whole project
+
+**WATI is not the application. WATI is the communication layer.**
+
+If you only remember one thing, remember this. Everything else follows from
+it.
+
+The honest one-line mental models:
+
+- **WATI = Mouth + Ears.** It sends and receives WhatsApp messages. That's
+  it.
+- **Your FastAPI backend = the Brain.** It decides what to say, looks things
+  up, makes every real decision.
+- **SQLite + the live Indihomes API = Memory.** The source of truth for what
+  a lead said and what inventory exists.
+
+```
+Customer (Megha)
+     │  types on WhatsApp
+     ▼
+WhatsApp (Meta)         ← the actual message pipe
+     │
+     ▼
+WATI                    ← Mouth + Ears: receives, and later speaks
+     │  webhook call (HTTP POST) at each step of the flow
+     ▼
+Your FastAPI backend    ← the Brain: every decision happens here
+     │
+     ├──► SQLite (appointments.db)      ← Memory: shortlists, bookings, opt-outs
+     ├──► Live Indihomes API            ← Memory: the actual property inventory
+     └──► Google Calendar / Email       ← booking + advisor notification
+```
+
+**Why this separation is the whole ballgame:** if Indihomes ever swaps WATI
+for Interakt, Gupshup, or Meta's Cloud API directly, *only the top box
+changes.* The Brain and the Memory are untouched. That's the hallmark of a
+system that won't need a rewrite next year.
+
+### Who owns what
+
+| Component | Responsibility |
+|---|---|
+| WhatsApp (Meta) | Delivers messages between Megha and the business |
+| WATI | The visual chatflow, buttons, templates, contacts, and the webhook calls into our backend |
+| **FastAPI backend (`app.py`)** | **Every decision: understand location, search inventory, book slots, classify free text, gate business hours** |
+| SQLite (`appointments.db`) | Per-phone state: the shortlist we showed, pending slots, bookings, opt-outs, follow-up timers |
+| Live Indihomes API (`property_api.py`) | The real, current property inventory |
+| Google Calendar / Brevo email | Site-visit events and advisor notifications |
+
+---
+
+## 3. How a single conversation actually flows
+
+The WATI chatflow is a graph of nodes. Most nodes are buttons. At a few key
+points, a node makes an **HTTP POST to our backend** (a "webhook node"),
+waits for the JSON response, and speaks whatever text that JSON contains.
+
+That request/response handshake is the heartbeat of the whole system.
+Let's trace Megha's conversation and name the endpoint behind each step:
+
+```
+Megha: "Hi, interested"        → WATI static welcome, buttons
+Megha: taps area / types area  → POST /location    (understand the area)
+Megha: taps "2 BHK"            │
+Megha: taps "1 Cr - 2 Cr"      │  (WATI collects these as it goes)
+Megha: taps "Own Use"          │
+Megha: taps priority           │
+   ...                         ▼
+[flow reaches the end]         → POST /search       (find + show properties)
+Megha: "1"                     → POST /property-detail  (show that project)
+Megha: taps "Book Site Visit"  → POST /available-slots  (show real free slots)
+Megha: "2"                     → POST /book-slot     (book it on the calendar)
+[booking done]                 → POST /save-lead     (write lead to CRM)
+```
+
+Each arrow is a webhook. Each webhook is a function in `app.py`. The pattern
+is always the same: **WATI sends what it has, the backend returns flat JSON,
+WATI displays fields from that JSON.**
+
+### The one shape rule that makes this work
+
+Every backend endpoint returns a **flat dict of strings**, because WATI's
+variable system can only read flat top-level fields — `@recommendations`,
+`@count`, `@name1`. It cannot dig into nested JSON. So you'll never see a
+deeply-nested response in this codebase; everything is deliberately flattened
+into `name1`, `detail1`, `image1`, `name2`, … precisely so a WATI Message
+node can print `{{name1}}`.
+
+---
+
+## 4. How we list properties (the search)
+
+This is `property_core.py`, the heart of the "Memory → answer" path.
+
+**Step 1 — where does inventory come from?** The live Indihomes API
+(`property_api.py`), refreshed on a TTL. `properties.json` is kept only as an
+*offline fallback* so the bot never dies if the API blips:
+
+```python
+def load(force=False):
+    raw = property_api.fetch_all(force=force)   # live API first
+    if raw:
+        _rebuild(raw); return
+    if not PROPERTIES:                          # only if we have nothing at all
+        _load_offline()                         # fall back to properties.json
+```
+
+**Step 2 — normalize the messy live data into one clean internal shape.**
+The live API has quirks (price sometimes 0 in one field, carpet sizes as
+strings *or* numbers, media as `["url"]` *or* `[{"url","tag"}]`). `_normalize()`
+is the single place that irons all of that out, so `search()` never has to
+think about API weirdness:
+
+```python
+def _normalize(r):   # live API record → internal shape
+    return {
+        "price_cr": lakh_to_cr(r["startingPrice"]["value"]),  # ALWAYS startingPrice
+        "configs": [c.lower().replace(" ","") for c in r["flatConfiguration"]],
+        "carpet": _normalize_carpet(r["carpetSize"]),         # str-or-number → float
+        ...
+    }
+```
+
+**Step 3 — `search()` filters in plain Python** over that clean list. No
+database query language, no external search service — the inventory is small
+enough that filtering in memory is simpler and fast:
+
+```python
+def matches(p):
+    if not loc_ok(p):          return False   # right area?
+    if cfg not in p["configs"]: return False   # right BHK?
+    if p["price_cr"] > ceiling: return False   # within budget?
+    return True
+
+results = [p for p in PROPERTIES if matches(p)]
+results.sort(key=amenity_score, reverse=True)  # best amenity match first
+top = results[:limit]
+```
+
+**Step 4 — return BOTH human text and machine data.** `recommendations` is
+the numbered list Megha reads; `shortlist` is a structured list saved to
+SQLite so that when she replies "1", `/property-detail` can resolve it
+*without a second API call*:
+
+```json
+{
+  "recommendations": "1. Sethia Pride\nNear Mahindra Gate\n1BHK / 2BHK, starting 0.98 Cr\n...",
+  "count": 3,
+  "name1": "Sethia Pride", "detail1": "...", "code1": "INV_KDE_608",
+  "shortlist": [{"index": 1, "code": "INV_KDE_608", "detail": "<full block>", "image": "..."}]
+}
+```
+
+That "save the shortlist so the next reply can resolve a number" trick is
+worth internalizing — it's why the bot can say "reply with a number" and
+actually know what number 2 *was*.
+
+---
+
+## 5. Where APScheduler is, and why
+
+**APScheduler = a cron job that lives inside your Python process.** No
+external cron server, no Railway add-on — just a background thread that wakes
+up on a timer and runs a function.
+
+Phase 1 uses it for **one** thing: the **2-hour follow-up nudge**
+(`followup_scheduler.py`).
+
+The problem it solves: Megha gets her 3 properties, then goes quiet — didn't
+say no, just got distracted. A good salesperson would nudge her a couple
+hours later. APScheduler is how the bot does that without a human watching a
+clock.
+
+```
+every 5 minutes (APScheduler BackgroundScheduler)
+        │
+        ▼
+run_followup_sweep()
+        │
+        ├─ ask conversation_tracker: who got recommendations 2h+ ago
+        │  AND hasn't replied since AND hasn't already been nudged?
+        │
+        ├─ for each such phone:
+        │     ├─ opted out ("stop")?  → skip forever
+        │     ├─ locked (mid-reply right now)? → skip this tick, catch next
+        │     └─ else → send the re-engagement WhatsApp, mark it sent
+        ▼
+```
+
+Note it sweeps **every 5 minutes** but only nudges someone whose **2-hour**
+window has elapsed — the 5-min tick is just how often it *checks*; the 2h is
+the actual wait. Two settings that matter for a Railway deploy:
+
+- `coalesce=True` — if the process restarts and two ticks pile up, run once,
+  not twice. **Prevents double-nudging on redeploy.**
+- `max_instances=1` — never two sweeps at once, even if WATI is slow.
+
+Phase 2 uses APScheduler much more heavily (the 45-second lead poll, the
+daily flush) — see that folder's `understand.md`.
+
+---
+
+## 6. The APIs we expose (the backend's public surface)
+
+Every one of these is a webhook a WATI node calls. Grouped by job:
+
+**Understanding & searching**
+- `POST /location` — takes free-text area ("Kandivali", "Thane mulund"),
+  runs it through Groq (an LLM) to normalize to a real locality, asks a
+  clarifying question if ambiguous ("Kandivali East or West?").
+- `POST /search` — the big one. Understands location + filters inventory +
+  returns the numbered shortlist. Saves the shortlist to SQLite.
+- `POST /property-detail` — resolves "1" / "2" / "3" against the saved
+  shortlist, returns the rich single-property block. **Also** the place free
+  text like "No one" or "send Borivali East" gets caught (see §7).
+
+**Booking**
+- `POST /available-slots` — pulls real free slots from Google Calendar.
+- `POST /book-slot` — books the chosen slot, emails the advisor, closes the
+  follow-up timer.
+
+**Lead handling & free text**
+- `POST /interpret-message` — the general "user typed something unexpected"
+  catch-all (see §7).
+- `POST /advisor-request` — "Talk to an Advisor" button → email advisors,
+  close conversation.
+- `POST /save-lead` — write the finished conversation to the CRM.
+- `POST /parse-priorities` — turn "1 and 3" into flat yes/no flags WATI can
+  branch on.
+
+**Ops**
+- `GET /health` — is everything wired? Now also reports `business_hours` and
+  `opted_out_count`.
+
+---
+
+## 7. The two hard problems we hit in production (and how we fixed them)
+
+These are the war stories. They're in `claude.md` in full; here's the
+*understanding* behind them.
+
+### Problem A — "users type instead of tapping buttons"
+
+**The trap:** WATI's chatflow is a graph where edges = button taps. When
+Megha *typed* "No one" and "Send in Borivali east also" instead of tapping,
+those messages hit nodes that only knew about buttons — and fell into a dead
+end. In the real transcript, a genuine buying signal ("show me Borivali too")
+was silently dropped and logged as if she'd declined an advisor.
+
+**The mental model of the fix:** a button tap is just a message whose text
+happens to equal a button label. So treat *every* inbound message the same
+way — classify it before assuming it's a button.
+
+We built `intent_router.py`: a small, **rule-based** (not LLM) classifier
+that catches five "global intents" — things that mean the same thing no
+matter what question was asked:
+
+```
+Any inbound free text
+        │
+        ▼
+intent_router.classify(text)
+        │
+   ┌────┴─────┬──────────┬───────────────┬──────────┐
+   ▼          ▼          ▼               ▼          ▼
+ stop    talk_to_    reject_all    change_location  restart
+        advisor    ("no one")   ("send Borivali")
+```
+
+**Why rule-based, not an LLM?** Five intents, each said a handful of ways.
+Rules are free, instant, and — critically for `stop` (compliance) —
+*deterministic*. An LLM belongs later, only if logs show real phrasings the
+rules miss. (This is the "80% deterministic, 20% AI" principle: don't route
+every message through an LLM in a sales flow — it's expensive, unpredictable,
+and hard to debug.)
+
+### Problem B — the WATI variable-syntax bug that ate our listings
+
+**The trap:** WATI has *two* different variable namespaces that look almost
+identical:
+- Flow Variables → written `@intent`
+- Contact Attributes → written `{{intent}}`
+
+Which one a webhook response field becomes depends on how it's *mapped* in
+WATI. We mapped `intent` as a Contact Attribute (`{{intent}}`) but wrote the
+condition nodes checking `@intent` — a Flow Variable that **didn't exist**.
+Every condition silently evaluated false. The backend was returning perfect
+data; WATI was reading the wrong variable and routing to the fallback.
+
+**The lesson that generalizes:** when the backend clearly returns the right
+value but the bot behaves as if it didn't, the bug is almost always in the
+WATI-side variable reference (wrong syntax, wrong type, or a missing key) —
+**not** the backend. The way we found it was checking the contact's actual
+attribute values in WATI right after a live message, not just reading the
+visible reply.
+
+A cousin of this bug: an early-exit path returned `reply_text` but forgot to
+also set `recommendations`. Since `{{recommendations}}` is a *persistent*
+Contact Attribute, WATI printed the literal text `{{recommendations}}` into
+the chat for a contact that had never had it set. **Lesson:** any handler
+that feeds a WATI template with multiple `{{placeholders}}` must set *every*
+one of those keys on *every* return path, even as `""`.
+
+---
+
+## 8. Business-hours gating (the most recent feature)
+
+**The problem:** the bot would happily reply and book things at 2 AM,
+promising a human callback nobody could honor. Indihomes wanted replies
+gated to 10 AM – 7 PM IST — but *without dropping* overnight leads.
+
+**Why WATI can't do this itself:** its native business-hours setting only
+governs WATI's *own* team inbox, not our custom webhook-driven flow. WATI has
+no idea when our backend chooses to reply. So the gate has to live in our
+code.
+
+The shape in Phase 1 (`business_hours.py` + a gate in `app.py`):
+
+```
+inbound webhook (any customer-facing endpoint)
+        │
+        ▼
+_off_hours_text(phone)
+        │
+   ┌────┴─────────────────────────┐
+   ▼                              ▼
+is_business_hours() == True     == False
+   │                              │
+proceed normally          return the off-hours notice
+(no change at all)         (skip LLM, skip search, skip booking)
+                                  │
+                          first message today → full notice
+                          repeat messages → short line
+```
+
+`is_business_hours()` is dead simple and worth reading once — it's the whole
+gate:
+
+```python
+def is_business_hours(dt=None):
+    dt = dt or datetime.now(IST)
+    return time(10,0) <= dt.astimezone(IST).time() <= time(19,0)
+```
+
+The "once-per-day notice" is tracked on the same `conversation_activity` row
+that already exists for the follow-up timer — no new table, per the design
+doc.
+
+**The Phase 1 vs Phase 2 split worth understanding:** Phase 1 is *reactive*
+(a customer messaged us first), so "off hours" just means "reply with a
+notice." Phase 2 is *proactive* (we message the lead first), so "off hours"
+means "queue the lead and send at 10 AM" — a genuinely different mechanism.
+Same `business_hours.py`, two different behaviors. See the Phase 2 doc.
+
+---
+
+## 9. Who owns what — the final table
+
+| Layer | File(s) | Job |
+|---|---|---|
+| Communication | (WATI, external) | Speak/listen on WhatsApp; call our webhooks |
+| Routing / decisions | `app.py` | Every endpoint; the Brain |
+| Free-text understanding | `intent_router.py`, `llm_location.py` | Classify typed messages; normalize areas |
+| Inventory | `property_core.py`, `property_api.py` | Load, normalize, search properties |
+| Per-phone memory | `appointments_db.py`, `conversation_tracker.py` | Shortlists, slots, bookings, opt-outs, timers |
+| Time gating | `business_hours.py` | The 10–7 IST window |
+| Background timing | `followup_scheduler.py` (APScheduler) | The 2-hour nudge |
+| Booking / notify | `calendar_service.py`, `email_service.py` | Calendar events, advisor emails |
+| Safety | `conversation_lock.py` | One request per phone at a time |
+
+---
+
+## 10. One sentence, and the next move
+
+**Phase 1 is a reactive WhatsApp qualification bot where WATI is only the
+mouth and ears, every real decision lives in a FastAPI backend that
+understands both buttons and free text, and per-phone memory in SQLite lets
+a stateless chatflow behave like it remembers the conversation.**
+
+**Next move if you want to go deeper:** open `app.py` and read
+`_run_global_intent()` top to bottom — it's the single function where the
+free-text feature, the business-hours gate, and the "return flat JSON WATI
+can read" rule all meet in one place. If you understand that function, you
+understand the spine of Phase 1.

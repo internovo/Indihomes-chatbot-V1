@@ -274,6 +274,73 @@ class AppGlobalIntentTests(unittest.TestCase):
         self.assertIn("recommendations", body)
         self.assertEqual(body["recommendations"], "")
 
+    def test_none_intent_logs_needs_human_with_flow_step(self):
+        # See claude.md, "Lead-safety-net": a genuinely unclassifiable
+        # message previously vanished with no record anywhere. It must now
+        # show up in appointments_db.list_needs_human, tagged with the
+        # flow_step the WATI node sent - this is what lets an advisor see
+        # WHERE a lead got stuck, not just that one did.
+        phone = "919999900105"
+        resp = self.client.post("/interpret-message", json={
+            "phone": phone, "message": "asdkjfh gibberish",
+            "flow_step": "budget", "name": "Test Lead",
+        })
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["intent"], "none")
+
+        rows = [r for r in appointments_db.list_needs_human(unnotified_only=False, limit=200)
+                if r["lead_phone"] == phone]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["flow_step"], "budget")
+        self.assertEqual(rows[0]["raw_message"], "asdkjfh gibberish")
+        self.assertEqual(rows[0]["notified"], 0)
+
+    def test_none_intent_without_flow_step_defaults_sensibly(self):
+        # /property-detail's unparseable-choice branch never sends
+        # flow_step (it predates the field) - must not crash, and must
+        # fall back to a labelled default rather than an empty string.
+        phone = "919999900106"
+        resp = self.client.post("/interpret-message", json={
+            "phone": phone, "message": "xyzxyz",
+        })
+        self.assertEqual(resp.status_code, 200)
+        rows = [r for r in appointments_db.list_needs_human(unnotified_only=False, limit=200)
+                if r["lead_phone"] == phone]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["flow_step"], "property_picker")
+
+    def test_needs_human_leads_endpoint_lists_and_acks(self):
+        phone = "919999900107"
+        self.client.post("/interpret-message", json={
+            "phone": phone, "message": "qwerty nonsense", "flow_step": "possession",
+        })
+        listing = self.client.get("/needs-human-leads", params={"limit": 200})
+        self.assertEqual(listing.status_code, 200)
+        matches = [r for r in listing.json()["leads"] if r["lead_phone"] == phone]
+        self.assertEqual(len(matches), 1)
+        row_id = matches[0]["id"]
+
+        ack = self.client.post("/needs-human-leads/ack", json={"ids": [row_id]})
+        self.assertEqual(ack.status_code, 200)
+        self.assertEqual(ack.json()["acked"], "yes")
+
+        listing_after = self.client.get("/needs-human-leads", params={"limit": 200})
+        matches_after = [r for r in listing_after.json()["leads"] if r["lead_phone"] == phone]
+        self.assertEqual(matches_after, [])  # acked rows are hidden by default
+
+    def test_recognised_intent_does_not_log_needs_human(self):
+        # A real global intent (stop/talk_to_advisor/reject_all/restart/
+        # change_location) must NOT also create a needs_human row - that
+        # table is specifically for the "we had nothing to offer" case, not
+        # every fallback-triggered message.
+        phone = "919999900108"
+        self.client.post("/interpret-message", json={
+            "phone": phone, "message": "please stop messaging me", "flow_step": "consent",
+        })
+        rows = [r for r in appointments_db.list_needs_human(unnotified_only=False, limit=200)
+                if r["lead_phone"] == phone]
+        self.assertEqual(rows, [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
