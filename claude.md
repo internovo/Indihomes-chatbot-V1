@@ -1200,3 +1200,334 @@ re-point them through the picker as described in the Bug 1 fix above.
   current private backend URL, but should get auth before any
   advisor-facing dashboard calls them from outside that trust boundary.
 
+---
+
+# CHANGELOG: `/lead-fallback` - matching the backend to the flow that actually imported
+
+## What happened
+
+Every later, more elaborate WATI flow version built during this project
+(v2 through v4, adding a continuation loop, a `change_location` branch
+with real listing delivery, condition-variable fixes) **repeatedly failed
+to import into WATI Builder** with a generic "Request failed" error, even
+after multiple rebuilds and structural validation. Eventually a bare
+re-import of a file that had ALREADY imported successfully once before
+also failed - conclusive evidence the block was environmental (WATI
+session/service), not anything in the JSON content, which had in fact
+been correct all along.
+
+What's actually live in WATI right now is an EARLIER, simpler draft -
+`Indihomes-main_prod__v4_phase1-fallback.json` (despite the "v4" in the
+filename, this is structurally the FIRST fallback design from this
+project, predating the /interpret-message-based versions). It successfully
+imported before the environmental issue started blocking further imports.
+
+## The gap this left
+
+That imported flow wires all 10 previously-empty button-node defaults to
+dedicated webhook nodes that call `POST /lead-fallback` - an endpoint that
+was designed early in this project but never actually implemented in
+`app.py`. Every one of those 10 nodes would have 404'd the moment a real
+customer triggered one.
+
+## What was built
+
+`LeadFallbackRequest` + `POST /lead-fallback`, matching this flow's
+EXISTING webhook contract exactly (`phone`, `name`, `last_step`,
+`raw_message`, `flow_node_id` in; `reply_text`, `is_business_hours` out) -
+no WATI changes needed, since the flow already imported successfully and
+re-importing has been unreliable.
+
+Internally, this reuses `intent_router.classify()` and `_run_global_intent()`
+- the exact same logic `/interpret-message` uses - so behaviour (opt-out,
+advisor handoff, reject_all, restart, and `needs_human` logging for
+anything unclassifiable) is consistent between both entry points; only the
+request/response shape differs to match what each flow version actually
+sends and reads.
+
+**One deliberate difference from `/interpret-message`:** this flow's
+message node only displays `{{reply_text}}` - there's no separate
+`{{recommendations}}` placeholder the more elaborate version has. For
+`change_location`, `/lead-fallback` combines `reply_text` and
+`recommendations` into a single `reply_text` string before returning, so
+real listings still reach the customer rather than only the intro line -
+same combine pattern already used in `/property-detail`'s
+unparseable-choice branch.
+
+## Known limitations of this simpler flow version (accepted, not fixed)
+
+- **`main_message-fallback-ack` is still a genuine dead end** - no
+  Question/Buttons node listens for whatever the customer types next
+  (unlike the v3/v4 continuation loop, which never made it into
+  production). A customer who keeps chatting after a fallback message
+  gets no further response until they trigger a different part of the
+  flow. Fixing this needs the same WATI-side change v3 already made
+  (main_question-fb-continue) - blocked on the same import issue as
+  everything else, not on any backend gap.
+- **`change_location` fired from here has no budget/configuration
+  context** - `LeadFallbackRequest` doesn't forward the conversation's
+  collected slot fields the way `InterpretMessageRequest` does, so a
+  fresh-area search here filters on location alone.
+- **No `stop`-specific carve-out** - unlike v3's `main_condition-fb-stop`,
+  this flow has no branching at all after the webhook call; `stop`'s
+  reply_text ("You won't hear from us again...") displays correctly, but
+  there's no flow-level distinction preventing further prompts afterward -
+  moot in practice since the node is terminal anyway (see above).
+
+## Testing
+
+```powershell
+cd C:\Users\admin\Desktop\Indihomes-chatbot-V1
+uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+```powershell
+# Real global intent
+Invoke-RestMethod -Uri "http://localhost:8000/lead-fallback" -Method Post `
+  -ContentType "application/json" -Body '{"phone":"919999913001","name":"Test","last_step":"budget","raw_message":"call me instead","flow_node_id":"main_buttons-budget"}'
+# Expect: reply_text="Perfect! An Indihomes advisor will contact you shortly."
+
+# change_location - confirm listings are actually in reply_text now
+Invoke-RestMethod -Uri "http://localhost:8000/lead-fallback" -Method Post `
+  -ContentType "application/json" -Body '{"phone":"919999913002","name":"Test","last_step":"priority","raw_message":"show me something in Malad","flow_node_id":"main_buttons-priority"}'
+# Expect: reply_text starts with "Sure - here'"'"'s what'"'"'s available there:" and
+# is followed by actual numbered listings, not just the intro line.
+
+# Unclassifiable - confirm it's logged
+Invoke-RestMethod -Uri "http://localhost:8000/lead-fallback" -Method Post `
+  -ContentType "application/json" -Body '{"phone":"919999913003","name":"Test","last_step":"consent","raw_message":"asdkjfh","flow_node_id":"main_buttons-consent"}'
+Invoke-RestMethod -Uri "http://localhost:8000/needs-human-leads"
+# Expect: a row with flow_step="consent", raw_message="asdkjfh".
+```
+
+Deploy this to Railway, then test one real WhatsApp message per outcome
+above, checking the actual bot reply against what `/lead-fallback` returns.
+
+---
+
+# CHANGELOG: fixed the fallback dead end (v3 import)
+
+## What was found
+
+Live-tested immediately after importing `Indihomes-main_v2_lead-safety-net.json`:
+Yashh Rane walked the flow normally, typed free text at the priority
+question ("Not sure, whatever you recommend"), correctly got routed to
+`main_webhook-fb-priority` → `main_condition-fb-global` (false branch,
+since this wasn't a global intent) → `main_message-fb-fallback`. That
+message displayed correctly. But `main_message-fb-fallback` (and
+`main_message-fb-ack`) had no outgoing edge and no Question/Buttons node
+after them - nothing in the flow was listening for whatever the customer
+typed next. The exact class of bug this whole feature exists to fix,
+reintroduced one layer downstream by the fix itself.
+
+## What was built - `Indihomes-main_v3_lead-safety-net.json`
+
+Four new nodes, inserted after the existing `main_message-fb-ack` /
+`main_message-fb-fallback` pair:
+
+```
+main_message-fb-ack ------┐
+main_message-fb-fallback -┴-> main_question-fb-continue
+                                ("Anything else, or want an advisor?")
+                                       ↓
+                              main_webhook-fb-continue
+                                (re-runs /interpret-message,
+                                 flow_step="post_fallback")
+                                       ↓
+                              main_condition-fb-stop  <-────────┐
+                               ↓ true          ↓ false        │
+                       main_message-fb-stopped   main_condition-fb-global
+                       (terminal - opt-out           ↓ true    ↓ false
+                        confirmed, do NOT ask     main_message-fb-ack / -fallback
+                        "anything else?")              (loops back up)
+```
+
+**`main_condition-fb-stop` (new)** sits in front of the existing
+`main_condition-fb-global` and checks `{{intent}} == "stop"` first. All 10
+`main_webhook-fb-*` webhooks were re-pointed to target this new condition
+instead of `main_condition-fb-global` directly - it's the single choke
+point every fallback path now runs through, both on first entry and on
+every loop iteration via `main_webhook-fb-continue`.
+
+**Why `stop` is carved out and everything else loops:** `reject_all` and
+`change_location`'s own `reply_text` already ends with a question
+("...would you like me to widen the search, or have an advisor call you
+instead?") - that reply had nowhere to route a follow-up before this fix,
+which was its own latent version of the same bug. Looping fixes that too.
+`stop`, by contrast, must not be followed by another question - continuing
+to prompt someone who just opted out reads as ignoring the opt-out, even
+if the prompt itself is compliant. `main_message-fb-stopped` shows the
+same `{{reply_text}}` ("You won't hear from us again...") and genuinely
+ends - no further node, matching the one case where a dead end is correct.
+
+**`main_question-fb-continue` (new)** - a plain free-text Question node,
+same shape and same native 3-retry-then-repeat behavior as every other
+free-text Question node in this flow (e.g. `main_question-wYPyQ`). Prompts
+"Is there anything else you'd like to share, or would you like me to
+connect you with an advisor now?"
+
+**`main_webhook-fb-continue` (new)** - re-runs whatever they typed through
+the same `/interpret-message` endpoint, `flow_step: "post_fallback"` so
+these loop iterations are distinguishable in the `needs_human` log from
+the original per-node dead ends.
+
+**No backend code change required** - `/interpret-message` already
+accepts arbitrary `flow_step` values and handles repeated calls for the
+same phone with no special casing needed. This is a WATI-flow-only fix.
+
+## Testing
+
+Manual only, since this is a graph-structure fix with no new backend
+behavior to unit test:
+
+1. Import `Indihomes-main_v3_lead-safety-net.json` into WATI Builder.
+2. Test each of the 4 new nodes once in Builder (per the "must-test-once"
+   webhook-binding rule - applies to `main_webhook-fb-continue` same as
+   every other webhook node in this flow).
+3. Walk the flow live, hit a fallback (e.g. free text at the priority
+   question), then type something ELSE after the fallback ack - confirm
+   the bot asks "anything else..." and actually responds to what you type
+   next, instead of going silent.
+4. Separately, trigger `stop` from any fallback node and confirm it does
+   NOT ask "anything else" afterward - just the opt-out confirmation, full
+   stop.
+
+## Known limitations (updated)
+
+- **The loop is unbounded** - a customer can keep chatting indefinitely
+  through `main_question-fb-continue`. Given `intent_router.classify()` is
+  free (no LLM call, no network), this is cheap to leave open-ended for
+  now; if real usage shows customers getting stuck circling this loop
+  without ever reaching a real resolution, the fix is to cap iterations
+  (e.g. after N unresolved loops, force a hand-off message and stop) - not
+  done here since there's no data yet suggesting it's needed.
+- **Still doesn't route back into the qualification flow itself** - even
+  inside the loop, a `change_location` reply shows fresh listings via
+  `reply_text`, but a follow-up like "actually show me 2 BHK" just gets
+  re-classified as `"none"` again (intent_router has no `change_configuration`
+  intent) rather than actually updating the search. The loop guarantees
+  the bot keeps LISTENING; it doesn't mean every follow-up gets fully
+  understood - that's still bounded by `intent_router.py`'s five intents.
+
+---
+
+# CHANGELOG: v4 - change_location results were never delivered
+
+## What was found
+
+Live-tested v3 immediately: Yashh typed "Actually just show me something
+  in malad" after hitting a fallback. `intent_router` correctly classified
+this as `change_location` (Malad is a known locality), the backend
+correctly ran a fresh search, but the bot only ever said "Sure - here's
+what's available there:" - the actual property listings never appeared.
+Two compounding bugs:
+
+1. **None of the `main_webhook-fb-*` nodes (nor the v3 continuation
+   webhook) captured `recommendations` or `count` as WATI response
+   variables.** They only captured `intent`, `is_global`, `reply_text` -
+   so even though the backend returned real listings in its JSON, WATI
+   never had anywhere to put them.
+2. **`main_message-fb-ack` only ever displays `{{reply_text}}`.** Even
+   with `recommendations` captured, this node has no `{{recommendations}}`
+   placeholder in its template at all.
+
+The result: `change_location` intents fired from ANY fallback path
+(all 10 original nodes, plus every loop iteration through
+`main_webhook-fb-continue`) silently dropped the actual results - the one
+outcome a customer most wants after specifying a new area.
+
+## What was built - `Indihomes-main_v4_lead-safety-net.json`
+
+Rather than patch `main_message-fb-ack` to conditionally show
+recommendations (which risks the exact "unsubstituted `{{recommendations}}`
+leaks as literal text" bug already documented above, for contacts who've
+never had that attribute set), this reuses the EXISTING, already-correct
+pattern `main_buttons-next`'s own loop uses for this exact situation
+(`main_condition-intloc` -> `main_message-intshow` -> `main_question-sKKYv`):
+
+```
+... fb-* webhook ...
+        |
+main_condition-fb-stop  (unchanged - stop still checked first)
+   false |
+main_condition-fb-location   <- NEW: checks {{intent}} == "change_location"
+   true |                              | false
+main_message-fb-location-show          main_condition-fb-global (unchanged)
+(shows reply_text + recommendations)
+   |
+main_question-sKKYv   <- joins the REAL property-picker flow
+```
+
+**All 11 fb-* / continue webhooks** (the original 10 plus
+`main_webhook-fb-continue`) now also capture `recommendations` and `count`
+as response variables, matching `main_webhook-interpret`'s own shape.
+
+**`main_condition-fb-location` (new)** sits between the stop check and the
+global/none check - `change_location` intents never reach
+`main_condition-fb-global` at all now; they branch off earlier into a
+dedicated path that actually delivers the search results.
+
+**`main_message-fb-location-show` (new)** - same template as the existing
+`main_message-intshow` (`{{reply_text}}` + `{{recommendations}}`), then
+routes into `main_question-sKKYv` - the SAME property-picker node
+`main_buttons-next`'s loop already uses. A customer who says "show me
+Malad" from any fallback point now gets real listings AND can reply with
+a number to see one in detail, same as the main flow.
+
+**Also trimmed `main_message-fb-fallback`'s text** - dropped the second
+sentence ("In the meantime, feel free to share anything else...") since
+`main_question-fb-continue` asks the functionally identical question
+immediately afterward; saying it twice in two consecutive bot messages
+read as repetitive. Confirmed live: Yashh saw both messages back to back
+and called it out directly.
+
+## Testing
+
+Manual only (graph-structure fix, no backend code touched):
+
+1. Import `Indihomes-main_v4_lead-safety-net.json`.
+2. Test each of the 2 new nodes (`main_condition-fb-location`,
+   `main_message-fb-location-show`) once in Builder, plus re-test all 11
+   fb-*/continue webhooks since their response-variable mappings changed
+   (added recommendations/count) - the "must-test-once" binding rule
+   applies again here.
+3. Reproduce the exact failure: hit any fallback, then type a message
+   naming a known locality (e.g. "show me something in Malad"). Confirm
+   the bot now shows a real numbered listing, not just the intro line.
+4. Confirm you can reply with a number afterward and get a real property
+   detail back (proves the `main_question-sKKYv` join actually works).
+5. Confirm the fallback message no longer repeats the "feel free to share
+   anything else" line twice in a row.
+
+## Phase 3 — Lead routing to salesperson (new)
+
+**What changed:** `/save-lead` now also calls the NEW
+`indihomes-lead-routing-service` (separate repo,
+`C:\Users\admin\Desktop\indihomes-lead-routing-service`) right alongside
+the existing `crm_service.push_lead()` call. That service resolves the
+recommended project's salesperson in Cosmos and notifies them on WhatsApp
+via an approved WATI template - this repo does NOT get Cosmos or
+salesperson-WATI credentials; it only knows the routing service's URL and
+a shared secret.
+
+**New file:** `lead_routing_client.py` — same shape as `crm_service.py`
+(`is_dry_run()`, `is_configured()`, never raises). `LEAD_ROUTING_DRY_RUN`
+defaults `true`, same safety convention as `CRM_DRY_RUN`.
+
+**New env vars** (see `.env`): `LEAD_ROUTING_URL`, `LEAD_ROUTING_SHARED_SECRET`,
+`LEAD_ROUTING_DRY_RUN`. All blank/default until the routing service is
+deployed and its URL/secret are filled in - until then this hook is a
+silent no-op, same pattern as every other optional integration in this repo.
+
+**Where it's called:** `_save_lead_locked()` in `app.py`, wrapped in its
+own try/except (belt-and-suspenders on top of `route_lead()` already never
+raising) so a routing-service failure can never affect what `/save-lead`
+returns to WATI or whether the CRM push already succeeded.
+
+**`/health` now reports** a `lead_routing` field: `NOT CONFIGURED`,
+`configured, DRY-RUN`, or `configured, LIVE`.
+
+See `indihomes-lead-routing-service/README.md` for the full Phase 3 design,
+including the one open verification item (confirming the real Cosmos
+`salesPerson`/`salesPersonNumber` field names before going live).
+

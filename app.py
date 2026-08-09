@@ -46,6 +46,7 @@ import calendar_service
 import appointments_db
 import email_service
 import crm_service
+import lead_routing_client
 import conversation_lock
 import conversation_tracker
 import intent_router
@@ -718,6 +719,111 @@ def _run_global_intent(intent: dict, req, phone: str) -> dict:
     return {"handled": "no", "action": "none", "reply_text": ""}
 
 
+class LeadFallbackRequest(BaseModel):
+    """Body for POST /lead-fallback - matches the WATI flow that's actually
+    LIVE in production right now (Indihomes-main_prod__v4_phase1-fallback.json,
+    the flow that successfully imported), where every previously-unwired
+    InteractiveButtons node's default/no-match path calls this endpoint
+    directly. This predates and is separate from /interpret-message's WATI
+    wiring below (which a later, more elaborate flow version used, but that
+    version repeatedly failed to import into WATI Builder - see claude.md,
+    "Lead-safety-net", for the full troubleshooting history).
+
+    Deliberately minimal, matching the flow's existing webhook body exactly
+    - this flow version does NOT forward the conversation's collected slot
+    fields (location/budget/configuration/etc.), unlike
+    InterpretMessageRequest. A change_location intent fired from here can
+    still resolve the NEW area from raw_message itself (intent_router's
+    own location_text extraction), but won't have the customer's existing
+    budget/configuration to filter by - a real but minor gap versus
+    /interpret-message, accepted here to match the already-imported WATI
+    flow exactly rather than requiring yet another re-import attempt.
+    """
+    phone: Optional[str] = ""
+    name: Optional[str] = ""
+    last_step: Optional[str] = ""
+    raw_message: Optional[str] = ""
+    flow_node_id: Optional[str] = ""
+
+
+@app.post("/lead-fallback")
+def lead_fallback(req: LeadFallbackRequest):
+    """Catches free text / an unmatched tap at any of the 10
+    InteractiveButtons nodes whose default path was previously empty (see
+    claude.md, "Lead-safety-net") - the exact class of bug behind the
+    Hitesh transcript (Malad/Goregaon/"Other Area" at the area picker) and
+    its siblings at every other button node in the flow.
+
+    Internally reuses the exact same intent_router.classify +
+    _run_global_intent logic /interpret-message uses below - same five
+    global intents, same needs_human logging for anything unclassifiable -
+    so behaviour is consistent across both entry points; only the request/
+    response shape differs, to match what THIS flow's webhook nodes
+    actually send and read (reply_text, is_business_hours - no
+    recommendations field, no intent/is_global condition variables).
+    """
+    phone = _clean_incoming(req.phone)
+    name = _clean_incoming(req.name)
+    raw = _clean_incoming(req.raw_message)
+    last_step = _clean_incoming(req.last_step) or "unknown_step"
+
+    if phone:
+        try:
+            conversation_tracker.touch_user_message(phone)
+        except Exception as e:
+            print(f"[app] conversation_tracker.touch_user_message failed (lead-fallback): {e}")
+
+    off_hours_text = _off_hours_text(phone)
+    if off_hours_text is not None:
+        # A CRM write, not a chat reply - gating this would delay CRM
+        # visibility without protecting anything (same reasoning as
+        # /save-lead elsewhere in this file). Log the dead end regardless
+        # of hours; an advisor picks it up from the queue either way.
+        if phone:
+            try:
+                appointments_db.mark_needs_human(phone, name, last_step, raw)
+            except Exception as e:
+                print(f"[app] mark_needs_human failed (lead-fallback, off hours): {e}")
+        return {"reply_text": off_hours_text, "is_business_hours": "no"}
+
+    intent = intent_router.classify(raw)
+
+    if intent.get("intent", "none") == "change_location":
+        # This flow's WATI message node only displays {{reply_text}} - there
+        # is no separate {{recommendations}} placeholder the way
+        # /interpret-message's main_message-intshow has. Combine both into
+        # reply_text so the actual listings still reach the customer
+        # instead of only the intro line - same combine pattern already
+        # used in /property-detail's unparseable-choice branch above.
+        result = _run_global_intent(intent, req, phone)
+        parts = [p for p in (result.get("reply_text", ""), result.get("recommendations", "")) if p]
+        reply_text = "\n\n".join(parts) or "Sorry, I didn't catch which area you meant."
+        return {"reply_text": reply_text, "is_business_hours": "yes"}
+
+    if intent.get("intent", "none") != "none":
+        result = _run_global_intent(intent, req, phone)
+        return {"reply_text": result.get("reply_text", "") or "Got it, thanks - noted!",
+                "is_business_hours": "yes"}
+
+    # Genuinely unclassifiable - log for advisor follow-up (see
+    # appointments_db.mark_needs_human) and give a warm generic
+    # acknowledgment rather than leaving the customer with nothing, since
+    # this flow version has no further node listening after this message
+    # (see claude.md, "Lead-safety-net" - known limitation, terminal by
+    # design in this simpler flow version).
+    if phone:
+        try:
+            appointments_db.mark_needs_human(phone, name, last_step, raw)
+        except Exception as e:
+            print(f"[app] mark_needs_human failed (lead-fallback): {e}")
+
+    return {
+        "reply_text": ("Got it - I've noted that down and one of our property "
+                        "advisors will follow up with you shortly."),
+        "is_business_hours": "yes",
+    }
+
+
 class InterpretMessageRequest(BaseModel):
     """Body for POST /interpret-message - the generic fallback endpoint.
     Wire this to WATI's catch-all / "no match" node so free text typed at
@@ -1091,6 +1197,30 @@ def _save_lead_locked(req: SaveLeadRequest, phone: str):
         "user_type": user_type,
     })
 
+    # Phase 3: notify the recommended project's salesperson via the new
+    # indihomes-lead-routing-service. Fires alongside the CRM push, not
+    # instead of it - independent best-effort side effects, same contract
+    # as everything else in this handler (a failure here must never affect
+    # what we return to WATI or whether the CRM push above already ran).
+    # No-ops entirely (no call, no log spam) until LEAD_ROUTING_URL and
+    # LEAD_ROUTING_SHARED_SECRET are set - see lead_routing_client.py.
+    try:
+        lead_routing_client.route_lead({
+            "phone": phone,
+            "name": _clean_incoming(req.name),
+            "location": _clean_incoming(req.location),
+            "budget": _clean_incoming(req.budget),
+            "configuration": _clean_incoming(req.configuration),
+            "possession_pref": _clean_incoming(req.possession_pref),
+            "purpose": _clean_incoming(req.purpose),
+            "amenities": _clean_incoming(req.amenities),
+            "project_code": _clean_incoming(req.project_code),
+            "recommendations": _clean_incoming(req.recommendations),
+            "outcome": outcome,
+        })
+    except Exception as e:
+        print(f"[app] lead_routing_client.route_lead failed: {e}")
+
     # Lead saved — close the conversation regardless of CRM success so the
     # scheduler doesn't nudge a lead who has already reached this endpoint.
     try:
@@ -1146,6 +1276,12 @@ def health():
     email_status = "connected" if email_service.is_configured() else "NOT CONFIGURED"
     wati_status = "connected" if wati_client.is_configured() else "NOT CONFIGURED"
     scheduler_status = "running" if _followup_scheduler._scheduler_running() else "NOT RUNNING"
+    if not lead_routing_client.is_configured():
+        lead_routing_status = "NOT CONFIGURED (Phase 3 hook is a no-op until LEAD_ROUTING_URL/LEAD_ROUTING_SHARED_SECRET are set)"
+    elif lead_routing_client.is_dry_run():
+        lead_routing_status = "configured, DRY-RUN"
+    else:
+        lead_routing_status = "configured, LIVE"
     return {
         "status": "ok",
         "properties_loaded": len(PROPERTIES),
@@ -1154,6 +1290,7 @@ def health():
         "calendar": calendar_status,
         "email": email_status,
         "wati": wati_status,
+        "lead_routing": lead_routing_status,
         "scheduler": scheduler_status,
         "advisors_loaded": len(calendar_service.advisor_emails()),
         "opted_out_count": appointments_db.opted_out_count(),
