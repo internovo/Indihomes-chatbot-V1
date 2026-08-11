@@ -342,5 +342,141 @@ class AppGlobalIntentTests(unittest.TestCase):
         self.assertEqual(rows, [])
 
 
+class ParseChoicesTests(unittest.TestCase):
+    """Direct, no-HTTP tests for app._parse_choices() - the multi-select
+    parser. See its docstring for the real production transcript that
+    motivated it: a customer replied "1 & 2" and only ever saw property #1,
+    because the OLD single-number parser (_parse_choice) matches the first
+    digit sequence it finds via re.search and stops there."""
+
+    @classmethod
+    def setUpClass(cls):
+        import app as app_module
+        cls.app_module = app_module
+
+    def test_single_number_returns_one_index(self):
+        self.assertEqual(self.app_module._parse_choices("2", 3), [2])
+
+    def test_ampersand_separated(self):
+        self.assertEqual(self.app_module._parse_choices("1 & 2", 3), [1, 2])
+
+    def test_comma_separated(self):
+        self.assertEqual(self.app_module._parse_choices("1, 3", 3), [1, 3])
+
+    def test_word_and_separated(self):
+        self.assertEqual(self.app_module._parse_choices("1 and 3", 3), [1, 3])
+
+    def test_preserves_first_mentioned_order_not_numeric_order(self):
+        # "2 & 1" should come back [2, 1], not sorted to [1, 2] - the
+        # customer's own ordering is preserved (e.g. if they want property
+        # 2 shown before property 1 in the combined reply).
+        self.assertEqual(self.app_module._parse_choices("2 & 1", 3), [2, 1])
+
+    def test_dedupes_repeated_numbers(self):
+        self.assertEqual(self.app_module._parse_choices("1, 1, 2", 3), [1, 2])
+
+    def test_out_of_range_numbers_are_dropped(self):
+        # Shortlist only has 3 items - "5" must not appear even though
+        # it's a well-formed number.
+        self.assertEqual(self.app_module._parse_choices("1 & 5", 3), [1])
+
+    def test_capped_at_max_choices(self):
+        self.assertEqual(self.app_module._parse_choices("1,2,3,4,5", 5, max_choices=3), [1, 2, 3])
+
+    def test_empty_or_no_digits_returns_empty_list(self):
+        self.assertEqual(self.app_module._parse_choices("", 3), [])
+        self.assertEqual(self.app_module._parse_choices("maybe the blue one", 3), [])
+
+
+class MultiPropertySelectionTests(unittest.TestCase):
+    """End-to-end reproduction of the Smriti transcript: replying "1 & 2"
+    to "Which one would you like to see in detail?" must show BOTH
+    properties, not silently truncate to the first one. See claude.md,
+    "Multi-property selection"."""
+
+    @classmethod
+    def setUpClass(cls):
+        from fastapi.testclient import TestClient
+        import app as app_module
+        cls.app_module = app_module
+        cls.client = TestClient(app_module.app)
+
+    def setUp(self):
+        self.phone = "919999900200"
+        appointments_db.save_shortlist(self.phone, [
+            {"index": 1, "name": "Siddhivinayak", "detail": "2BHK / 2.5BHK, starting 1.22 Cr",
+             "image": "img1.png", "code": "SV1"},
+            {"index": 2, "name": "Hitendra Dhamm", "detail": "2BHK / Jodi, starting 1.9 Cr",
+             "image": "img2.png", "code": "HD1"},
+            {"index": 3, "name": "Silver Serene", "detail": "2BHK, starting 1.98 Cr",
+             "image": "img3.png", "code": "SS1"},
+        ])
+
+    def test_1_and_2_shows_both_properties_not_just_the_first(self):
+        # This is THE regression test for the exact bug: the old parser
+        # (re.search, first match only) would return just property #1 here.
+        resp = self.client.post("/property-detail", json={
+            "phone": self.phone, "choice": "1 & 2",
+        })
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["found"], "yes")
+        self.assertEqual(body["count"], 2)
+        self.assertIn("Siddhivinayak", body["detail"])
+        self.assertIn("Hitendra Dhamm", body["detail"])
+        # Property #3 was NOT asked for - must not appear.
+        self.assertNotIn("Silver Serene", body["detail"])
+
+    def test_per_index_fields_populated_for_multi_select(self):
+        resp = self.client.post("/property-detail", json={
+            "phone": self.phone, "choice": "1 & 2",
+        })
+        body = resp.json()
+        self.assertEqual(body["name1"], "Siddhivinayak")
+        self.assertEqual(body["name2"], "Hitendra Dhamm")
+        self.assertEqual(body["code1"], "SV1")
+        self.assertEqual(body["code2"], "HD1")
+
+    def test_top_level_image_is_first_picks_image_only(self):
+        # WATI can only render ONE inline image per message today - a
+        # known, documented limitation (see claude.md), not a bug. The
+        # top-level image_url is the FIRST picked property's image.
+        resp = self.client.post("/property-detail", json={
+            "phone": self.phone, "choice": "1 & 2",
+        })
+        body = resp.json()
+        self.assertEqual(body["image_url"], "img1.png")
+
+    def test_single_number_unaffected_by_the_multi_select_change(self):
+        # No regression: a plain "1" must behave exactly as it always did.
+        resp = self.client.post("/property-detail", json={
+            "phone": self.phone, "choice": "1",
+        })
+        body = resp.json()
+        self.assertEqual(body["found"], "yes")
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(body["name"], "Siddhivinayak")
+        self.assertEqual(body["detail"], "2BHK / 2.5BHK, starting 1.22 Cr")
+
+    def test_three_properties_at_once(self):
+        resp = self.client.post("/property-detail", json={
+            "phone": self.phone, "choice": "1, 2 and 3",
+        })
+        body = resp.json()
+        self.assertEqual(body["count"], 3)
+        for name in ("Siddhivinayak", "Hitendra Dhamm", "Silver Serene"):
+            self.assertIn(name, body["detail"])
+
+    def test_multi_select_does_not_trigger_global_intent_classification(self):
+        # "1 & 2" must resolve as a multi-select BEFORE ever reaching
+        # intent_router.classify() - it should never be misread as some
+        # other intent (it isn't one).
+        resp = self.client.post("/property-detail", json={
+            "phone": self.phone, "choice": "1 & 2",
+        })
+        body = resp.json()
+        self.assertNotIn("intent", body)  # only the no-match branch sets this key
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

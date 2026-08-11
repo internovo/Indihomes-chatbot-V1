@@ -29,7 +29,7 @@ import os
 import re
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import Optional
+from typing import List, Optional
 
 from property_core import search, PROPERTIES, KNOWN_LOCALITIES
 from llm_location import (
@@ -133,6 +133,12 @@ def _off_hours_text(phone: str) -> Optional[str]:
 class SearchRequest(BaseModel):
     """Everything the chatbot collected, sent in one go."""
     phone: Optional[str] = ""   # needed so we can remember the shortlist per phone
+    # Optional - WATI usually hasn't collected the customer's name by the
+    # time /search fires (name is typically asked later in the flow), but
+    # if it has, forward it here so the Phase 3 salesperson notification
+    # (see notify_recommendations() below) can include it. Blank is fine
+    # and handled gracefully downstream.
+    name: Optional[str] = ""
     # location may arrive as free text (from the open question) and/or as a
     # button value. We accept several names so the flow can send whatever it has.
     message: Optional[str] = ""
@@ -251,6 +257,30 @@ def one_call_search(req: SearchRequest):
                 appointments_db.save_shortlist(phone, result["shortlist"])
             except Exception as e:
                 print(f"[app] could not save shortlist: {e}")
+
+            # Phase 3: notify each shown property's salesperson NOW, right
+            # when the shortlist is first displayed - not at /save-lead
+            # (see lead_routing_client.py's module docstring for why that
+            # would be actively wrong here: it closes the conversation and
+            # pushes a CRM lead, neither of which belongs on a plain
+            # search). Independent best-effort call per project code, each
+            # idempotent on (phone, code) - a refined/repeated search never
+            # re-notifies the same salesperson for a property already shown.
+            try:
+                codes = [item.get("code", "") for item in result["shortlist"] if item.get("code")]
+                lead_routing_client.notify_recommendations({
+                    "phone": phone,
+                    "name": _clean_incoming(req.name),
+                    "location": _clean_incoming(req.best_location()),
+                    "budget": _clean_incoming(req.budget),
+                    "configuration": _clean_incoming(req.configuration),
+                    "possession_pref": req.best_possession(),
+                    "purpose": _clean_incoming(req.purpose),
+                    "amenities": _clean_incoming(req.amenities),
+                    "project_codes": codes,
+                })
+            except Exception as e:
+                print(f"[app] lead_routing_client.notify_recommendations failed: {e}")
         result["search_in_progress"] = "no"
         result["conversation_locked"] = "no"
         # Start the 2-hour re-engagement timer only if recommendations were
@@ -309,50 +339,90 @@ def property_detail(req: PropertyDetailRequest):
         return {"found": "no", "name": "", "image_url": "",
                 "detail": "That list has expired. Please tell me your requirements again to see fresh options."}
 
-    idx = _parse_choice(choice, len(items))
-    if idx is None:
-        # Not a valid number - before falling back to the generic retry
-        # copy, check whether this is actually a global intent in disguise.
-        # This is the exact production failure documented in claude.md:
-        # "No one" (reject_all) and "Send in borivali east also"
-        # (change_location) were both typed right here, at this node, and
-        # both got the generic "reply 1-3" message instead of a real answer.
-        intent = intent_router.classify(choice)
-        if intent["intent"] != "none":
-            result = _run_global_intent(intent, req, phone)
-            # IMPORTANT: reply_text and recommendations are DIFFERENT fields
-            # and both can be present (change_location sets both - a short
-            # intro line AND the actual listings). Combine them rather than
-            # picking one with `or` - reply_text is always truthy when set,
-            # so an `or` chain here would silently swallow the real property
-            # listings and show only the intro line. Caught by hand-testing
-            # the change_location path before wiring it into WATI - see
-            # claude.md, "Free-text handling", changelog.
-            detail_parts = [p for p in (result.get("reply_text", ""),
-                                         result.get("recommendations", "")) if p]
-            detail_text = "\n\n".join(detail_parts) or \
-                f"Please reply with a number between 1 and {len(items)} to see that property."
-            return {
-                "found": "no",
-                "name": result.get("name1", "") or "",
-                "image_url": "",
-                "code": "",
-                "detail": detail_text,
-                "intent": intent["intent"],
-                "is_global": "yes",
-            }
-        return {"found": "no", "name": "", "image_url": "",
-                "detail": f"Please reply with a number between 1 and {len(items)} to see that property.",
-                "intent": "none", "is_global": "no"}
+    # IMPORTANT: _parse_choices (multi-select) must be checked FIRST, not
+    # after _parse_choice. "1 & 2" would otherwise ALSO satisfy
+    # _parse_choice's first-match regex (re.search finds "1" and stops),
+    # silently returning just property #1 before this branch ever ran -
+    # that is EXACTLY the original bug (see _parse_choices' docstring for
+    # the real transcript). Checking multi-select first and falling back
+    # to the single-choice/global-intent path only when it finds nothing
+    # is what actually fixes it.
+    indices = _parse_choices(choice, len(items))
 
-    item = items[idx - 1]
-    return {
-        "found": "yes",
-        "name": item.get("name", ""),
-        "detail": item.get("detail", ""),
-        "image_url": item.get("image", ""),
-        "code": item.get("code", ""),
-    }
+    if len(indices) > 1:
+        picked = [items[i - 1] for i in indices]
+        # Multiple properties requested in one reply (e.g. "1 & 2").
+        # Combine into ONE "detail" string so the EXISTING WATI message
+        # node (which just prints {{detail}}) shows all of them with
+        # ZERO flow changes required - same "fix works without a WATI
+        # edit" principle used throughout this project. Per-index fields
+        # (name1/detail1/image1/code1, name2/...) are ALSO exposed for a
+        # future WATI update that shows each property as its own message/
+        # card - WATI can only render ONE inline image per message today,
+        # so `image_url` here is only the FIRST picked property's image;
+        # showing every picked property's own image needs that future
+        # per-index WATI update, not just this backend change. See
+        # claude.md, "Multi-property selection".
+        combined_detail = "\n\n---\n\n".join(item.get("detail", "") for item in picked)
+        out = {
+            "found": "yes",
+            "name": picked[0].get("name", ""),
+            "detail": combined_detail,
+            "image_url": picked[0].get("image", ""),
+            "code": picked[0].get("code", ""),
+            "count": len(picked),
+        }
+        for n, item in enumerate(picked, start=1):
+            out[f"name{n}"] = item.get("name", "")
+            out[f"detail{n}"] = item.get("detail", "")
+            out[f"image{n}"] = item.get("image", "")
+            out[f"code{n}"] = item.get("code", "")
+        return out
+
+    if len(indices) == 1:
+        item = items[indices[0] - 1]
+        return {
+            "found": "yes",
+            "name": item.get("name", ""),
+            "detail": item.get("detail", ""),
+            "image_url": item.get("image", ""),
+            "code": item.get("code", ""),
+            "count": 1,
+        }
+
+    # No valid number at all (single or multi) - check whether this is
+    # actually a global intent in disguise.
+    # This is the exact production failure documented in claude.md:
+    # "No one" (reject_all) and "Send in borivali east also"
+    # (change_location) were both typed right here, at this node, and
+    # both got the generic "reply 1-3" message instead of a real answer.
+    intent = intent_router.classify(choice)
+    if intent["intent"] != "none":
+        result = _run_global_intent(intent, req, phone)
+        # IMPORTANT: reply_text and recommendations are DIFFERENT fields
+        # and both can be present (change_location sets both - a short
+        # intro line AND the actual listings). Combine them rather than
+        # picking one with `or` - reply_text is always truthy when set,
+        # so an `or` chain here would silently swallow the real property
+        # listings and show only the intro line. Caught by hand-testing
+        # the change_location path before wiring it into WATI - see
+        # claude.md, "Free-text handling", changelog.
+        detail_parts = [p for p in (result.get("reply_text", ""),
+                                     result.get("recommendations", "")) if p]
+        detail_text = "\n\n".join(detail_parts) or \
+            f"Please reply with a number between 1 and {len(items)} to see that property."
+        return {
+            "found": "no",
+            "name": result.get("name1", "") or "",
+            "image_url": "",
+            "code": "",
+            "detail": detail_text,
+            "intent": intent["intent"],
+            "is_global": "yes",
+        }
+    return {"found": "no", "name": "", "image_url": "",
+            "detail": f"Please reply with a number between 1 and {len(items)} to see that property.",
+            "intent": "none", "is_global": "no"}
 
 
 @app.post("/debug-search")
@@ -455,6 +525,35 @@ def _parse_choice(choice: str, slot_count: int) -> Optional[int]:
     if 1 <= n <= slot_count:
         return n
     return None
+
+
+def _parse_choices(choice: str, slot_count: int, max_choices: int = 3) -> List[int]:
+    """Like _parse_choice, but returns EVERY valid number mentioned, not
+    just the first - accepts '1 & 2', '1, 3', '1 and 3', etc. Deduped,
+    in first-mentioned order, capped at max_choices (a hard guard against
+    a pathological '1,2,3,4,5' flooding a single WhatsApp message - the
+    shortlist itself is never longer than 5, but showing 5 full detail
+    blocks in one reply is a bad experience regardless of whether it's
+    technically parseable). Empty list if nothing valid is found.
+
+    Real production case that motivated this (see claude.md, "Multi-
+    property selection"): a customer replied "1 & 2" to 'Which one would
+    you like to see in detail?' - the OLD single-number parser
+    (_parse_choice, first match only) silently returned just property #1;
+    the customer's explicit request to also see property #2 was dropped
+    without a trace, and the bot moved straight to "Would you like an
+    advisor?" as if only one property had ever been asked about.
+    """
+    if not choice:
+        return []
+    picked: List[int] = []
+    for m in re.finditer(r"\d+", choice):
+        n = int(m.group())
+        if 1 <= n <= slot_count and n not in picked:
+            picked.append(n)
+        if len(picked) >= max_choices:
+            break
+    return picked
 
 
 _PRIORITY_LABELS = {

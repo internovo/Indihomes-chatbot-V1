@@ -412,3 +412,180 @@ a stateless chatflow behave like it remembers the conversation.**
 free-text feature, the business-hours gate, and the "return flat JSON WATI
 can read" rule all meet in one place. If you understand that function, you
 understand the spine of Phase 1.
+
+---
+
+## 11. The lead-safety-net — what happens when nobody taps a button
+
+Section 7 already covered `intent_router.py` catching free text at ONE
+node (`main_buttons-next`, the post-shortlist menu). This section is
+about the much bigger version of that problem: **every other button
+node in the flow had the same hole, and closing it turned into a real
+production saga worth understanding end to end.**
+
+### The problem, in one real transcript
+
+A lead (Hitesh Tailor) hit this exact sequence:
+
+```
+Bot: Which area are you looking in?  [Goregaon] [Malad] [Other Area]
+Hitesh: Malad
+Hitesh: Goregaon        ← sent both in quick succession
+Bot: Just to narrow it down - Malad East or Malad West?
+Hitesh: Other Area      ← typed, didn't match either option
+[bot goes silent — nothing happens]
+```
+
+Investigating turned up **two separate, genuinely different bugs**
+wearing the same disguise:
+
+1. The specific burst-message failure (rapid "Malad" then "Goregaon"
+   landing on a stale clarify-question) was a real, narrow bug —
+   already fixed in `llm_location.py` (an "Other Area" sentinel + a
+   fresh-location override; see `claude.md`'s "burst-message location
+   bug" entry).
+2. The *general* version — **9 of the 10 `InteractiveButtons` nodes in
+   the whole flow had an empty `interactiveButtonsDefaultNodeResultId`**
+   — was still wide open. Only `main_buttons-next` (§7's story) had
+   ever been wired to catch unmatched input. Free text or an emoji at
+   `consent`, `config`, `budget`, `flex`, `purpose`, `priority`,
+   `possession`, `wFpLC` (loan follow-up), or `RRfox` (closing menu)
+   had nowhere to go — the conversation just stopped, and the CRM had
+   no way to tell "this lead went cold on their own" apart from "the
+   bot ate their message."
+
+### Why this needed a WATI change, not just a backend change
+
+This is the section 2 lesson ("WATI is not the application") pushed to
+its edge case: **a backend fix alone cannot catch a message WATI never
+forwards.** If a button node has no default path, WATI simply never
+calls any webhook for an unmatched reply — there is no HTTP request
+for `app.py` to even see. The fix necessarily has two halves: a WATI
+flow change (give every button node a default path to call) and a
+backend change (something for that path to call).
+
+### The WATI import saga — a real lesson about "done" vs "deployed"
+
+The first fix built was the *good* version: every empty default routes
+to a dedicated webhook, all funneling into a shared
+check-intent → maybe-loop-back-for-more chain, so a customer could keep
+talking after a fallback instead of hitting a second dead end. It was
+built, validated (node/edge graph checked programmatically for
+dangling references), and genuinely correct — and then **WATI's
+Builder repeatedly refused to import it**, with nothing more specific
+than a generic "Request failed." Multiple rebuilds didn't fix it. The
+diagnostic step that actually settled it: re-importing a file that had
+*already imported successfully once before* also failed — conclusive
+proof the block was environmental (a WATI session/service issue), not
+anything in the JSON.
+
+**The lesson that generalizes:** correct code (or a correct config
+file) sitting on disk is not the same claim as "this is running in
+production." Between "I built the fix" and "the fix is live" sits an
+entire deployment mechanism that can fail for reasons that have
+nothing to do with whether the fix is right. Don't skip verifying the
+last mile.
+
+### What's actually live right now
+
+Because of that import wall, what's deployed today is an **earlier,
+simpler draft** — `Indihomes-main_prod__v4_phase1-fallback.json`
+(confusingly named; it predates the continuation-loop version
+described above). It wires all 10 previously-empty defaults to
+dedicated webhook nodes, but every one of them dead-ends at a single
+shared acknowledgment message — no loop, no way to keep chatting
+afterward. Simpler, and known to actually import, which turned out to
+matter more than being maximally elegant.
+
+```
+any InteractiveButtons node's unmatched reply
+        │
+        ▼
+main_webhook-fb-<node>  →  POST /lead-fallback
+        │
+        ▼
+reply_text shown  →  conversation ends here (known limitation)
+```
+
+### `POST /lead-fallback` — matching the backend to the flow that's actually live
+
+Rather than force yet another risky re-import, the backend was built
+to match this simpler flow's *existing* webhook contract exactly
+(`phone`, `name`, `last_step`, `raw_message`, `flow_node_id` in;
+`reply_text`, `is_business_hours` out) — internally reusing the exact
+same `intent_router.classify()` + `_run_global_intent()` logic
+`/interpret-message` already used, so behavior (opt-out, advisor
+handoff, `change_location`, `needs_human` logging) is identical
+regardless of which endpoint a WATI node happens to call:
+
+```python
+intent = intent_router.classify(raw)
+
+if intent["intent"] == "change_location":
+    # this flow's message node has no separate {{recommendations}}
+    # placeholder — combine both into one reply_text so real listings
+    # still reach the customer, not just the intro line
+    result = _run_global_intent(intent, req, phone)
+    reply_text = "\n\n".join(p for p in (result["reply_text"], result["recommendations"]) if p)
+elif intent["intent"] != "none":
+    result = _run_global_intent(intent, req, phone)
+    reply_text = result["reply_text"]
+else:
+    appointments_db.mark_needs_human(phone, name, last_step, raw)   # NEW
+    reply_text = "Got it - I've noted that down and one of our property advisors will follow up with you shortly."
+```
+
+### `needs_human` — the CRM-visibility half of the fix
+
+Before this, a genuinely unclassifiable message (an emoji, gibberish,
+something none of the five intents matched) got logged nowhere. It
+didn't crash, didn't show a blank message — it just vanished, and in
+the CRM a lead that hit this looked *identical* to a lead who simply
+never replied. `appointments_db.mark_needs_human()` gives it a real
+record — `flow_step` (which node), `raw_message` (what they actually
+typed), timestamped — surfaced via `GET /needs-human-leads` as an
+advisor worklist, with `POST /needs-human-leads/ack` to clear handled
+rows.
+
+### The known, accepted gap
+
+Because the *deployed* flow version dead-ends after one fallback
+message (the continuation-loop version never made it past the import
+wall), whatever a customer types *next* after a fallback still has
+nowhere to go. This is tracked, not hidden — see `claude.md`'s
+"Lead-safety-net" changelog for the full status — and would need
+either a successful re-import of the loop version, or building the
+loop into whatever flow version does eventually import cleanly.
+
+---
+
+## 12. The Phase 3 hook — notifying a salesperson, not just the customer
+
+Everything in this file so far is about talking to the *customer*.
+`/save-lead` now also fires a second, independent call:
+`lead_routing_client.route_lead(lead)` — a best-effort POST to
+`indihomes-lead-routing-service` (Phase 3), which resolves the
+recommended project's salesperson in Cosmos and notifies *them* on
+WhatsApp.
+
+```
+POST /save-lead
+        │
+        ├──► crm_service.push_lead()         (existing — writes the CRM record)
+        └──► lead_routing_client.route_lead() (NEW — best-effort, never raises)
+                     │
+                     ▼
+        indihomes-lead-routing-service (Phase 3)
+```
+
+**Currently a safe no-op in production**, on purpose: `LEAD_ROUTING_URL`
+in this repo's `.env` is still a localhost placeholder
+(`http://127.0.0.1:8080`) because the routing service hasn't been
+deployed anywhere yet. The hook is written defensively — a failed
+connection is caught, logged, and ignored — specifically so that
+shipping this code early doesn't risk breaking `/save-lead` itself
+while Phase 3 is still being finished. See
+`../indihomes-lead-routing-service/understand.md` for that service's
+own full design, and its `claude.md` for exactly what's still blocking
+it from going live (deployment, a real Cosmos key, and confirming the
+salesperson field names against a real document).

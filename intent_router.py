@@ -78,7 +78,7 @@ _ADVISOR_PHRASES = [
 # missing the occasional genuine short rejection.
 _REJECT_PHRASES = [
     "no one", "none", "none of these", "none of them", "nothing", "not this",
-    "not interested in these", "don't like any", "dont like any",
+    "not these", "not interested in these", "don't like any", "dont like any",
     "not what i want", "not what i'm looking for", "not what im looking for",
 ]
 

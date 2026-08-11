@@ -1531,3 +1531,302 @@ See `indihomes-lead-routing-service/README.md` for the full Phase 3 design,
 including the one open verification item (confirming the real Cosmos
 `salesPerson`/`salesPersonNumber` field names before going live).
 
+---
+
+# CHANGELOG: multi-property selection ("1 & 2", production, Smriti transcript)
+
+## The transcript
+
+```
+Bot: Which one would you like to see in detail? Reply with its number.
+Smriti: 1 & 2
+Bot: [shows only property #1 - Siddhivinayak]
+Bot: Would you like one of our property advisors to help you explore these options further?
+```
+
+Smriti explicitly asked to see BOTH property #1 and #2. She only ever saw
+#1 - her second request was silently dropped, with no error, no partial
+acknowledgment, nothing. The bot then moved straight to the advisor
+question as if her request had been fully answered.
+
+## Root cause
+
+`_parse_choice()`, the function `/property-detail` used to resolve a
+numbered reply, is a single-match parser:
+
+```python
+def _parse_choice(choice: str, slot_count: int) -> Optional[int]:
+    m = re.search(r"\d+", choice)   # finds the FIRST digit sequence only
+    ...
+```
+
+`re.search(r"\d+", "1 & 2")` matches `"1"` and stops - `"2"` is never even
+looked at. This isn't a parsing failure that fell through to a retry
+message (which would at least have been visible); it's a SILENT partial
+match that looks, from the customer's side, exactly like a fully successful
+reply.
+
+## The fix
+
+A new function, `_parse_choices()` (plural), that finds EVERY valid number
+in the reply via `re.finditer` instead of `re.search`, deduped, in
+first-mentioned order, capped at `max_choices=3`:
+
+```python
+def _parse_choices(choice: str, slot_count: int, max_choices: int = 3) -> List[int]:
+    picked: List[int] = []
+    for m in re.finditer(r"\d+", choice):
+        n = int(m.group())
+        if 1 <= n <= slot_count and n not in picked:
+            picked.append(n)
+        if len(picked) >= max_choices:
+            break
+    return picked
+```
+
+**Ordering bug caught and fixed during implementation, before it ever
+shipped:** the first version of this fix nested the new multi-select check
+INSIDE `if idx is None:` (i.e. only tried after the OLD single-number
+`_parse_choice` had already run). That's wrong - `_parse_choice("1 & 2", 3)`
+itself returns `1` (a "successful" single match), so `idx` is never `None`
+and the new branch would NEVER execute for exactly the case it was built to
+fix. The fix had to check `_parse_choices` FIRST, then fall back to the
+single-number/global-intent path only when it finds nothing. Worth
+remembering as a general lesson: when replacing a "first match wins" parser
+with a "find every match" one, the new parser has to run BEFORE the old one
+gets a chance to silently "succeed" on a partial answer.
+
+**Response shape, and why it needs no WATI changes:** for 2+ picks, every
+property's `detail` is joined into ONE string (`"\n\n---\n\n"`-separated)
+and returned as the SAME `detail` field the existing WATI message node
+already prints via `{{detail}}` - so both properties show up with **zero
+flow changes required**, the same "fix works without a WATI edit"
+principle used throughout this project (see "Free-text handling" and
+"Business hours gating" above for the same pattern). Per-index fields
+(`name1`/`detail1`/`image1`/`code1`, `name2`/...) are ALSO included for a
+future WATI update that shows each property as its own message/card.
+
+**Known, documented limitation:** WATI can only render ONE inline image
+per message today. `image_url` for a multi-select reply is only the FIRST
+picked property's image - showing every picked property's own image needs
+a future WATI flow update (e.g. a loop over the per-index `image1`/`image2`
+fields, sending each as a separate Image message), not just this backend
+change. This is a real, permanent gap in the current single-message
+response shape, not a bug - flagging it here so it isn't rediscovered as a
+surprise later.
+
+## Testing
+
+```powershell
+cd C:\Users\admin\Desktop\Indihomes-chatbot-V1
+python -m unittest tests.test_intent_router -v
+```
+
+Two new test classes: `ParseChoicesTests` (direct, no-HTTP - single number,
+`&`/`,`/`and` separators, first-mentioned-order preservation, dedup,
+out-of-range dropping, the `max_choices` cap, empty/no-digits) and
+`MultiPropertySelectionTests` (full HTTP reproduction of the Smriti
+transcript via `/property-detail` - both properties present in `detail`,
+the third NOT asked for correctly absent, per-index fields populated,
+`image_url` is deliberately only the first pick's image, a plain single
+`"1"` completely unaffected by this change, three-at-once, and confirms
+multi-select resolves before ever reaching `intent_router.classify()`).
+
+---
+
+# Phase 3 fix — notification trigger moved from /save-lead to /search
+
+**The bug:** the original Phase 3 wiring (see "Phase 3 — Lead routing to
+salesperson" above) only fired `lead_routing_client.route_lead()` from
+`/save-lead` - which only gets called when a lead reaches a TERMINAL
+outcome (books a site visit, asks for an advisor, or is explicitly marked
+not interested). The overwhelming majority of leads who see a shortlist of
+properties never reach that point in a single session - meaning most
+salesperson notifications were never firing at all. Phase 3's actual
+purpose - "tell the salesperson someone is looking at their listing" - was
+being gated behind an outcome most leads never produce.
+
+**Why not just call `/save-lead` right after `/search`:**
+1. `/save-lead` calls `conversation_tracker.close_conversation(phone)` -
+   closing the conversation the moment results are SHOWN, before the
+   customer has said anything else, would break the 2-hour re-engagement
+   follow-up for every single search.
+2. `/save-lead` calls `crm_service.push_lead()` - creating a CRM lead
+   record for every search (including someone testing three different
+   areas in one sitting) would flood the CRM with low-intent noise that
+   isn't a real lead handoff.
+
+**The fix:** new `lead_routing_client.notify_recommendations()`, a
+separate function from `route_lead()`, called from `one_call_search()`
+(`/search`) right after the shortlist is saved - fires ONE independent
+best-effort POST per project code shown, with NO CRM push and NO
+conversation close. `route_lead()` / `/save-lead` are unchanged and still
+handle the terminal-outcome case exactly as before.
+
+**Idempotency design (the part worth understanding, not just copying):**
+each code's request uses its own key, `direct_website:search:{phone}:{code}`
+- scoped to (phone, project_code), not the whole shortlist as one unit.
+This means: showing the SAME property again in a refined/repeated search
+does NOT re-notify that salesperson (already recorded as sent for that
+phone+code pair); a DIFFERENT phone shown the SAME property DOES get its
+own independent notification; a NEW code the phone hasn't seen before DOES
+notify even if other codes in the same shortlist were already sent
+earlier. All of this dedup logic lives entirely in the routing service's
+own idempotency store (see `indihomes-lead-routing-service`'s
+`app/repositories/routing_log.py`) - nothing new to track on this side.
+
+**Accepted trade-off - no name at search time:** WATI typically hasn't
+collected the customer's name by `/search` (`SearchRequest` gained an
+optional `name` field for the rare case it has, but usually this will be
+blank at this stage, and the WATI template shows "(no name)" for that
+variable). This was weighed against firing later, at `/property-detail`
+(which already has `name` on `PropertyDetailRequest`, since the customer
+has engaged further by then) - firing at `/search` was chosen anyway, on
+the product decision that speed-to-salesperson matters more than a
+complete name field. If that decision changes, moving the
+`notify_recommendations()` call from `one_call_search()` to
+`property_detail()` is a small, contained change - the function itself
+doesn't care which endpoint calls it.
+
+**Also worth knowing:** this trigger point means a lead casually browsing
+multiple unrelated areas can generate several salespeople getting pinged
+for properties that never go anywhere. The per-(phone, code) idempotency
+key caps this at one notification per property-per-phone ever, but does
+not suppress notifying many DIFFERENT salespeople for a single browsing
+session. Not addressed here - flagged for whoever owns the product call on
+whether that's acceptable long-term.
+
+Tested: `lead_routing_client.py`'s new `notify_recommendations()` and
+refactored shared `_post()` helper were syntax-checked and functionally
+exercised (dry-run payload shape per code, correct per-code idempotency
+keys, no-phone/no-codes skip paths, `route_lead()` unchanged) before this
+was considered done - see conversation history for the actual command
+output, not just the code.
+
+---
+
+# CHANGELOG: "not these" reject_all gap + two WATI flows patched (Meta Ads + Phase 2 campaign flow)
+
+## Bug fixed: `_REJECT_PHRASES` had a plural gap
+
+Sonali replied "Not these..liberty garden locality" to a property
+shortlist. Should have classified as `reject_all`; instead fell through to
+the generic "reply 1-5" message. Cause: `_REJECT_PHRASES` had `"not this"`
+but not `"not these"` - a real, one-line gap.
+
+**Fix** in `intent_router.py`: added `"not these"` to `_REJECT_PHRASES`.
+
+**Deliberately NOT changed:** "liberty garden locality" was never
+recognised as a location either - Liberty Garden isn't in
+`KNOWN_LOCALITIES`/`SPLIT_RULES` (it's a real Malad West sub-locality, not
+one of the broad areas this whitelist covers). Whether to add it as an
+alias is a PRODUCT/DATA decision, not a code bug - not changed without
+that confirmation.
+
+**Also observed, not fixed:** Sonali sent one more message after the
+conversation reached its terminal "Not Right Now" closing message
+(`main_buttons-wFpLC`'s branch) and got no reply. Same class of dead-end
+the v3 continuation loop fixed for the `fb-*` nodes, just via a different
+path (`main_buttons-wFpLC` has no default wiring or continuation loop of
+its own). Flagged as a follow-up candidate, not fixed here.
+
+## Two more WATI flows patched: Meta Ads flow (prod) + Phase 2's campaign flow
+
+Both flows uploaded, patched programmatically (not hand-edited), and
+verified after generation: every `InteractiveButtons` default path resolves
+to a real node, every edge target exists, every Condition node's
+true/false targets exist, and fan-in (multi-parent) nodes were enumerated
+and confirmed to be only intended shared real targets.
+
+### `Meta-Ads_flow__prod__updated.json`
+
+Turned out to be a near-exact structural duplicate of Phase 1's own main
+flow (identical node IDs) but **completely unpatched** - all 10
+`InteractiveButtons` nodes had empty default paths, `main_webhook-HFQPC`
+had no `intent`/`is_global` capture. A separate WATI flow (different lead
+source), not the same flow re-exported.
+
+Patched with the FINAL, already-debugged version of every fix documented
+above - not the intermediate buggy states:
+
+1. **`main_webhook-HFQPC`** - added `prop_intent`/`is_global` response
+   variables (`{{ }}` syntax correct from the start - no Bug-1-style `@`
+   mistake this time), plus `main_condition-propintent` looping
+   `change_location` back to `main_question-sKKYv`. Body also now forwards
+   full slot context from day one (better than Phase 1's original minimal
+   body).
+2. **`main_buttons-next`** keeps its OWN dedicated subgraph
+   (`main_webhook-interpret` + condition/message chain, self-looping),
+   mirroring Phase 1's actual live-tested structure exactly.
+3. **The other 9 buttons nodes** each get a `main_webhook-fb-*` node with
+   a distinct `flow_step`, funnelling into ONE shared chain:
+   `main_condition-fb-stop` -> `-location` -> `-global` -> `ack`/`fallback`
+   -> `main_question-fb-continue` -> loop. Final v2+v3+v4 design, not the
+   intermediate dead-end/missing-recommendations states.
+4. **`main_buttons-wFpLC` gained a new `interactiveButtonsUserInputVariable`**
+   (`loan_followup_reply`) - had none set at all originally, so there was
+   no variable for free text to land in. Purely additive.
+5. **Used `POST /interpret-message` throughout, not `/lead-fallback`** -
+   unlike Phase 1's history (which fell back to `/lead-fallback` only
+   because later versions failed to import, an environmental issue, not a
+   design choice), this flow is fresh, so it gets full context forwarding
+   from the start.
+
+### `phase2-v3_prod__updated.json`
+
+Much smaller flow - only 2 `InteractiveButtons` nodes (`camp_buttons-confirm`,
+`camp_buttons-next`). A useful discovery while patching: **`camp_webhook-slots`
+and `camp_webhook-book` already point at PHASE 1's backend**
+(`web-production-ea977.up.railway.app`), not Phase 2's own - this answers
+the open question in Phase 2's own `claude.md` about how site-visit
+booking actually works in that flow. Updated there too.
+
+**A real design mistake caught and corrected before finalizing this file**:
+the first draft tried to SHARE one condition chain between both button
+nodes' default paths, forking only at the very end for the origin-specific
+"no match" loop-back. Doesn't work - WATI condition nodes have no memory of
+which node they were entered from, so a shared chain can't know, at its
+final branch, whether to loop back to `camp_buttons-confirm` or
+`camp_buttons-next`. **The fix**: each origin gets its OWN self-contained
+5-condition chain, but every condition's TRUE branch still points at the
+SAME real, pre-existing nodes (`camp_message-advisor`, `camp_webhook-slots`,
+`camp_message-close`, `camp_message-detail`) since those don't care which
+node the fallback came from - only the chain STRUCTURE is duplicated.
+Verified programmatically: every multi-parent node in the final file is
+one of these four real targets, never a new condition/webhook node.
+
+Each of the 5 conditions per chain routes to the ACTUAL useful action, not
+a generic acknowledgment: `stop` -> opt-out -> `camp_message-close`;
+`talk_to_advisor` -> real `camp_message-advisor`; `site_visit` -> real
+`camp_webhook-slots` (now confirmed to actually work, per the Phase-1-
+backend discovery above); `not_interested` -> real `camp_message-close`;
+`show_details` -> real `camp_message-detail` (re-displays already-cached
+Contact Attributes, no extra backend round-trip - simpler than the
+backend's own `show_details` handler).
+
+**Known limitation, same as Phase 1's `intent_router.py` itself**: neither
+chain resolves a LOCAL yes/no answer to `camp_buttons-confirm`'s own
+question if typed as free text - "yes that's right" doesn't match any of
+the 5 global intents, falls through to the generic fallback, loops back to
+the SAME question. Not silently broken (re-asks correctly), just not
+maximally clever - out of scope for a straight port of the global-intent
+pattern.
+
+## Verification performed before handing off both files
+
+For each output file: parsed and re-serialized to confirm valid JSON;
+every `InteractiveButtons` default confirmed non-empty and pointing at a
+real node; every edge target confirmed to exist; every Condition node's
+true/false targets confirmed to exist; fan-in nodes enumerated and
+confirmed intended.
+
+**Not verified, and can't be from the JSON alone**: visually confirm in
+Builder, after import, that every new default-path connector actually
+draws a visible line, and that `{{ }}` vs `@` syntax bound correctly on
+every new Condition node - re-point through the picker if any show the
+wrong prefix after import, per Bug 1's lesson earlier in this file. Given
+the volume of new nodes in the Meta Ads flow especially (26 new nodes), a
+visual pass through the whole canvas is worth the time before trusting
+this live.
+
+
