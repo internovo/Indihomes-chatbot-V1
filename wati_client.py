@@ -124,7 +124,7 @@ def send_followup_buttons(phone: str, name: str = "") -> bool:
     payload = {
         "body": (
             f"{greeting} just checking in! 🏡\n\n"
-            "We understand buying a home is a big decision, and it's completely normal to take some time"
+            "We understand buying a home is a big decision, and it's completely normal to take some time ." 
             "If you'd like, one of our property advisors can personally help you compare projects, explain pricing, and answer any questions."
         ),
         "buttons": [
@@ -144,7 +144,7 @@ def send_followup_buttons(phone: str, name: str = "") -> bool:
         phone,
         (
             f"{greeting} just checking in! 🏡\n\n"
-            "We understand buying a home is a big decision, and it's completely normal to take some time"
+            "We understand buying a home is a big decision, and it's completely normal to take some time ."
            "If you'd like, one of our property advisors can personally help you compare projects, explain pricing, and answer any questions."
         ),
     )
