@@ -589,3 +589,44 @@ while Phase 3 is still being finished. See
 own full design, and its `claude.md` for exactly what's still blocking
 it from going live (deployment, a real Cosmos key, and confirming the
 salesperson field names against a real document).
+
+---
+
+## 13. A second, sibling hook: lead-events, feeding indihomes-os's Lead Capture UI
+
+Section 12 covers *notifying a salesperson*. A separate, later addition
+covers something adjacent but different: *feeding the internal CRM's
+"AI Activity" tick and "Lead Journey" tracker* so a human looking at a
+lead in indihomes-os can see, at a glance, whether the WhatsApp bot
+actually reached them and how far the conversation got — without
+opening this bot's own logs.
+
+Same mental model as §12's diagram, one more arrow:
+
+```
+POST /search, /property-detail, /advisor-request, /save-lead
+        │
+        └──► os_events_client.emit()   (NEW — best-effort, never raises)
+                     │
+                     ▼
+        indihomes-os's POST /api/lead-events
+        (drives the Lead Capture screen's AI Activity tick
+         and Lead Journey vertical tracker)
+```
+
+Checkpoints emitted: `requirements_shared`, `options_shared`,
+`detail_shared`, `advisor_requested`, `tagging_sent`, `opted_out` (from
+`app.py`), plus `no_reply` and `followup_sent` (from
+`followup_scheduler.py`'s existing 5-minute sweep — see that file's
+`get_due_followups()`, which already computes "no reply within 2h" for
+an unrelated reason and turned out to be exactly the signal this needed
+too, so no separate poller was built).
+
+**Same safety posture as §12's hook**: `os_events_client.py` mirrors
+`lead_routing_client.py`'s shape almost exactly (dry-run default true,
+never raises, urllib). Currently a no-op in practice — `OS_EVENTS_URL`
+isn't set, and there's nothing to POST to yet regardless
+(indihomes-os's own backend is itself incomplete right now — see that
+repo's `structure.md`). See `claude.md`'s "Lead events" task section for
+the full checkpoint-by-checkpoint writeup, including a real bug caught
+and fixed while wiring `no_reply`'s idempotency key.

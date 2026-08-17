@@ -1829,4 +1829,109 @@ the volume of new nodes in the Meta Ads flow especially (26 new nodes), a
 visual pass through the whole canvas is worth the time before trusting
 this live.
 
+---
+
+# TASK: Lead events - feeding indihomes-os's Lead Capture UI
+
+## What this is
+
+indihomes-os (the internal CRM/ops app - separate repo,
+`indihomes-os-restructured` on this machine) grew a "Lead Capture" screen
+with an AI Activity tick (did WhatsApp/voice actually reach this lead) and
+a vertical "Lead Journey" checkpoint tracker. Both need real data from
+this bot's conversations. This task wires that up on the sending side.
+
+## What was built
+
+### `os_events_client.py` (new)
+
+Mirrors `lead_routing_client.py`'s exact shape - `is_configured()`,
+`is_dry_run()` (default `true`, same safety convention), plain `urllib`,
+never raises. One function, `emit(phone, checkpoint, payload=None,
+source_ref="", idempotency_key="")`, posting to indihomes-os's
+`POST /api/lead-events`. `channel` is always `"whatsapp"` from this repo -
+there is no voice concept here (that's Sarvam, posting directly to
+indihomes-os, not through this client).
+
+**Not live yet, on purpose**: `OS_EVENTS_URL` isn't set, so every call is
+currently a no-op (or, once you set it, a DRY-RUN log) - indihomes-os's
+own `server.cjs` doesn't exist yet either (see that repo's
+`backend/LEAD_EVENTS_INTEGRATION.md` for the full story), so there is
+literally nothing to POST to right now. Wiring it in on this side ahead of
+that being ready is deliberate - the moment indihomes-os's backend is
+restored and `OS_EVENTS_URL`/`OS_EVENTS_DRY_RUN=false` are set here, every
+checkpoint below starts flowing with zero further code changes.
+
+### `app.py` - emit() calls added at five real checkpoints
+
+| Checkpoint | Where | Notes |
+|---|---|---|
+| `requirements_shared` | `one_call_search()` | Fired regardless of match count - it's about what the customer told us, not the search outcome. |
+| `options_shared` | `one_call_search()`, inside the `shortlist` branch | idempotency_key scoped to `(phone, resolved_location, count)` so a genuinely new search logs fresh, not deduped against an unrelated earlier shortlist. |
+| `detail_shared` | `property_detail()`, both the multi-select and single-select success branches | Multi-select emits all picked codes in one event, matching the "1 & 2" fix's own combined-response shape. |
+| `advisor_requested` | `advisor_request()` | Fires once, inside the lock, after the advisor email is sent. |
+| `tagging_sent` | `_save_lead_locked()` | Fired regardless of whether the CRM push itself succeeded (crm_service already tracks that separately) - this event means "the conversation reached a terminal outcome," not "the CRM push worked." |
+
+Also, as a bonus (not originally asked for, but cheap and consistent):
+`opted_out` fires from `_run_global_intent`'s `stop` branch, right
+alongside the existing `appointments_db.mark_opted_out` call.
+
+### `followup_scheduler.py` + `conversation_tracker.py` - `no_reply` / `followup_sent`
+
+**Design decision, revised from the original plan**: earlier design
+notes for this feature assumed indihomes-os would need to synthesize
+"no reply within 2h" itself via a polling sweep. That turned out to be
+unnecessary - `followup_scheduler.py`'s `get_due_followups()` **already
+computes exactly this** (see that function's own eligibility query). So
+`no_reply` is emitted directly in `run_followup_sweep()`, right when a row
+is confirmed due, before the actual WATI send is attempted (so it's
+logged even if the send itself then fails); `followup_sent` is emitted
+right after `conversation_tracker.mark_followup_sent()` succeeds.
+
+**A real bug caught while wiring this**: the idempotency key for
+`no_reply` needs to change across follow-up cycles for the same phone
+(so a second, later occurrence isn't wrongly deduped against the first),
+but `get_due_followups()`'s `SELECT` didn't return `followup_due_at` at
+all - only `lead_phone`/`lead_name`. Using it in the idempotency key
+would have silently produced a constant, near-useless key. Fixed by
+adding `followup_due_at` to that `SELECT` (purely additive - the
+function's contract and every existing caller are unaffected).
+
+### `/health`
+
+Now reports `os_events`: `NOT CONFIGURED` / `configured, DRY-RUN` /
+`configured, LIVE` - same three-state convention as `lead_routing`.
+
+## Required env vars (not in this repo's `.env` - no `.env.example` exists
+## here to template from, so documenting directly)
+
+```
+OS_EVENTS_URL=                  # indihomes-os's base URL, e.g. https://<indihomes-os host>
+OS_EVENTS_SHARED_SECRET=        # optional - sent as X-OS-Events-Secret if set
+OS_EVENTS_DRY_RUN=true          # flip to false only once indihomes-os's POST /api/lead-events is confirmed reachable
+OS_EVENTS_TIMEOUT=10            # seconds
+```
+
+## Known limitations
+
+- **Not tested against a live indihomes-os** - that backend doesn't exist
+  yet (see indihomes-os-restructured's own gap, documented in that repo's
+  `structure.md` and `backend/LEAD_EVENTS_INTEGRATION.md`). `os_events_client.py`
+  itself was fully tested in isolation (dry-run logging, not-configured
+  no-op, real HTTP POST against a throwaway local server) before being
+  wired into `app.py`.
+- **No "lead_replied" / "template_sent" checkpoints from this repo** -
+  this bot is reactive (WATI's own static flow sends the very first
+  message and receives the customer's first reply; this backend only
+  sees whichever webhook node fires after that), so this backend has no
+  reliable signal for "the very first message was sent/replied to." Not
+  fabricated - left as a gap for whichever part of the system does have
+  that visibility (WATI's own delivery status, if ever exposed).
+- **Phone format is passed through unchanged** (typically `91XXXXXXXXXX`,
+  no leading `+`) - normalization to indihomes-os's bare-10-digit
+  convention happens entirely on that repo's side
+  (`lead-intake.cjs`'s `normalizePhone`), not here. See `os_events_client.py`'s
+  module docstring for why guessing at that convention on this side would
+  be worse than leaving it to the system that owns it.
+
 

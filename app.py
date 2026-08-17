@@ -47,6 +47,7 @@ import appointments_db
 import email_service
 import crm_service
 import lead_routing_client
+import os_events_client
 import conversation_lock
 import conversation_tracker
 import intent_router
@@ -252,11 +253,39 @@ def one_call_search(req: SearchRequest):
         return _search_in_progress_response()
     try:
         result, _ = run_pipeline(req, limit=5)
+
+        # Lead-events: log what the customer told us, regardless of whether
+        # a match was found - "requirements shared" is about the customer's
+        # input, not the search outcome. Best-effort, never allowed to affect
+        # the response - same contract as every other side effect below.
+        if phone:
+            try:
+                os_events_client.emit(phone, "requirements_shared", {
+                    "location": _clean_incoming(req.best_location()),
+                    "configuration": _clean_incoming(req.configuration),
+                    "budget": _clean_incoming(req.budget),
+                    "purpose": _clean_incoming(req.purpose),
+                })
+            except Exception as e:
+                print(f"[app] os_events_client requirements_shared failed: {e}")
+
         if phone and result.get("shortlist"):
             try:
                 appointments_db.save_shortlist(phone, result["shortlist"])
             except Exception as e:
                 print(f"[app] could not save shortlist: {e}")
+
+            # Lead-events: the actual shortlist shown - idempotency_key
+            # scoped to the resolved location so a genuinely NEW search
+            # (different area) logs as a fresh event, not a dedup of an
+            # unrelated earlier shortlist for the same phone.
+            try:
+                os_events_client.emit(phone, "options_shared", {
+                    "count": result.get("count"),
+                    "codes": [item.get("code", "") for item in result["shortlist"] if item.get("code")],
+                }, idempotency_key=f"{phone}:options_shared:{result.get('resolved_location','')}:{result.get('count')}")
+            except Exception as e:
+                print(f"[app] os_events_client options_shared failed: {e}")
 
             # Phase 3: notify each shown property's salesperson NOW, right
             # when the shortlist is first displayed - not at /save-lead
@@ -377,10 +406,22 @@ def property_detail(req: PropertyDetailRequest):
             out[f"detail{n}"] = item.get("detail", "")
             out[f"image{n}"] = item.get("image", "")
             out[f"code{n}"] = item.get("code", "")
+        if phone:
+            try:
+                os_events_client.emit(phone, "detail_shared", {
+                    "codes": [item.get("code", "") for item in picked if item.get("code")],
+                })
+            except Exception as e:
+                print(f"[app] os_events_client detail_shared (multi) failed: {e}")
         return out
 
     if len(indices) == 1:
         item = items[indices[0] - 1]
+        if phone:
+            try:
+                os_events_client.emit(phone, "detail_shared", {"code": item.get("code", "")})
+            except Exception as e:
+                print(f"[app] os_events_client detail_shared failed: {e}")
         return {
             "found": "yes",
             "name": item.get("name", ""),
@@ -645,6 +686,10 @@ def advisor_request(req: AdvisorRequestRequest):
             "phone": phone,
             "appt_type": "followup_advisor_request",
         })
+        try:
+            os_events_client.emit(phone, "advisor_requested", {"name": name})
+        except Exception as e:
+            print(f"[app] os_events_client advisor_requested failed: {e}")
         # Mark the conversation closed so the scheduler never sends another nudge.
         try:
             conversation_tracker.close_conversation(phone)
@@ -695,6 +740,10 @@ def _run_global_intent(intent: dict, req, phone: str) -> dict:
                 conversation_tracker.close_conversation(phone)
             except Exception as e:
                 print(f"[app] opt-out handling failed: {e}")
+            try:
+                os_events_client.emit(phone, "opted_out")
+            except Exception as e:
+                print(f"[app] os_events_client opted_out failed: {e}")
         return {"handled": "yes", "action": "stop",
                 "reply_text": "You won't hear from us again. Take care!"}
 
@@ -1320,6 +1369,18 @@ def _save_lead_locked(req: SaveLeadRequest, phone: str):
     except Exception as e:
         print(f"[app] lead_routing_client.route_lead failed: {e}")
 
+    # Lead-events: tagging_sent means "we recorded a final status for this
+    # conversation" - fired regardless of whether the CRM push itself
+    # succeeded (crm_service already has its own dry-run/failure tracking;
+    # this event is about the conversation reaching a terminal outcome, not
+    # about CRM delivery specifically).
+    try:
+        os_events_client.emit(phone, "tagging_sent", {
+            "outcome": outcome, "status": main_status, "sub_status": sub_status,
+        })
+    except Exception as e:
+        print(f"[app] os_events_client tagging_sent failed: {e}")
+
     # Lead saved — close the conversation regardless of CRM success so the
     # scheduler doesn't nudge a lead who has already reached this endpoint.
     try:
@@ -1381,8 +1442,15 @@ def health():
         lead_routing_status = "configured, DRY-RUN"
     else:
         lead_routing_status = "configured, LIVE"
+    if not os_events_client.is_configured():
+        os_events_status = "NOT CONFIGURED (lead-events hook is a no-op until OS_EVENTS_URL is set)"
+    elif os_events_client.is_dry_run():
+        os_events_status = "configured, DRY-RUN"
+    else:
+        os_events_status = "configured, LIVE"
     return {
         "status": "ok",
+        "os_events": os_events_status,
         "properties_loaded": len(PROPERTIES),
         "known_localities": KNOWN_LOCALITIES,
         "llm": llm,

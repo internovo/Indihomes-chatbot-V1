@@ -40,6 +40,7 @@ import logging
 import appointments_db
 import conversation_lock
 import conversation_tracker
+import os_events_client
 import wati_client
 
 logger = logging.getLogger(__name__)
@@ -106,11 +107,26 @@ def run_followup_sweep() -> None:
             )
             continue
 
+        # Lead-events: reaching this point IS the "no reply within 2h" signal
+        # - get_due_followups() already computed it (see this module's own
+        # eligibility query), so no separate synthesizer is needed elsewhere.
+        # Fired once per sweep row, before the actual send attempt, so it's
+        # logged even if the WATI send itself then fails.
+        try:
+            os_events_client.emit(phone, "no_reply", {"name": name},
+                                   idempotency_key=f"{phone}:no_reply:{row.get('followup_due_at', '')}")
+        except Exception as e:
+            logger.error("[followup_scheduler] os_events_client no_reply failed for %s: %s", phone, e)
+
         try:
             ok = wati_client.send_followup_buttons(phone, name)
             if ok:
                 conversation_tracker.mark_followup_sent(phone)
                 logger.info("[followup_scheduler] follow-up sent and marked for %s", phone)
+                try:
+                    os_events_client.emit(phone, "followup_sent", {"name": name})
+                except Exception as e:
+                    logger.error("[followup_scheduler] os_events_client followup_sent failed for %s: %s", phone, e)
             else:
                 logger.warning(
                     "[followup_scheduler] wati_client returned False for %s — will retry next sweep",

@@ -197,7 +197,7 @@ def get_due_followups() -> List[Dict]:
     try:
         rows = conn.execute(
             """
-            SELECT lead_phone, lead_name
+            SELECT lead_phone, lead_name, followup_due_at
             FROM conversation_activity
             WHERE followup_sent = 0
               AND followup_due_at <= ?
