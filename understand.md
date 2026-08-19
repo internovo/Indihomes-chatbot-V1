@@ -630,3 +630,79 @@ isn't set, and there's nothing to POST to yet regardless
 repo's `structure.md`). See `claude.md`'s "Lead events" task section for
 the full checkpoint-by-checkpoint writeup, including a real bug caught
 and fixed while wiring `no_reply`'s idempotency key.
+
+---
+
+## 14. `{{recommendations}}` leaking on the MAIN flow, not just fallbacks
+
+§11 and its "Bug 2" cousin (documented in `claude.md`) both cover an
+unsubstituted `{{placeholder}}` leaking to a real customer because a
+WATI Contact Attribute was never set for that contact. Both of those
+were scoped to fallback/free-text paths, with an explicit earlier
+claim that the MAIN `/search` → `main_message-recommend` path "was
+never at risk", because `property_core.search()` unconditionally
+returns a `recommendations` key on every code path. **That claim turned
+out to be true about the DATA but not about the TIMING** — a real
+production transcript showed the literal token "{{recommendations}}"
+sent to a customer (Neeti Shukla) right after she completed the full
+qualification flow.
+
+### The actual mechanism
+
+`property_core.search()` calls `_ensure_fresh()` first, which used to
+work like this:
+
+```python
+def _ensure_fresh():
+    ttl = property_api._cache_ttl()          # default 300s
+    if (time.time() - _state["ts"]) > ttl:
+        load(force=True)                     # BLOCKING, inline
+```
+
+`load(force=True)` → `property_api.fetch_all(force=True)` pages
+through the ENTIRE live Indihomes catalogue — potentially several
+sequential HTTP calls, each with its own `INDIHOMES_API_TIMEOUT`
+(default 15s). Whichever customer's `/search` request happened to land
+right as the 5-minute cache expired got stuck waiting on that whole
+refresh, INLINE, before WATI ever saw a response. If that refresh ran
+long enough, **WATI's own webhook timeout gave up first** — the
+backend would still finish and return good data moments later, but too
+late for WATI to capture it into the `recommendations` Contact
+Attribute. The customer got the intro line, then the literal,
+unsubstituted token.
+
+This is a subtly different failure mode from Bug 2's "field was never
+set on this contact" — here the field WOULD have been set, just not in
+time. It only bites the unlucky request that lands exactly when the
+cache is stale (rare, which is why it wasn't caught earlier), not
+every request (which is why it looked safe under normal testing).
+
+### The fix
+
+`_ensure_fresh()` now NEVER blocks the caller on a live network call.
+A stale cache (or the offline fallback) is served immediately; the
+refresh runs on a daemon thread that updates `PROPERTIES` for the NEXT
+search once it completes, guarded so a refresh already in flight isn't
+duplicated:
+
+```python
+def _ensure_fresh():
+    if (time.time() - _state["ts"]) <= ttl:
+        return
+    if _refresh_lock.acquire(blocking=False):
+        if _state["_refreshing"]:
+            return
+        _state["_refreshing"] = True
+        _refresh_lock.release()
+    else:
+        return
+    threading.Thread(target=_background_refresh, daemon=True).start()
+```
+
+**The generalizable lesson:** "this endpoint always returns valid
+data" and "this endpoint always returns FAST" are two different
+claims. A webhook integration like WATI's cares about both — a
+correct-but-slow response is, from the customer's side, indistinguishable
+from no response at all. Any code path that can trigger a live network
+call inline with a customer-facing request is a latent version of this
+bug, regardless of whether the data it eventually returns is correct.

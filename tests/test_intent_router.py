@@ -478,5 +478,70 @@ class MultiPropertySelectionTests(unittest.TestCase):
         self.assertNotIn("intent", body)  # only the no-match branch sets this key
 
 
+class CleanIncomingAtVariableLeakTests(unittest.TestCase):
+    """Direct, no-HTTP tests for app._clean_incoming()'s @variable guard.
+
+    Real production bug (see claude.md): main_webhook-dcBeI's /search body
+    always sends "amenities":"@amenities", but that Flow Variable is only
+    ever assigned when the customer picks "Amenities" as their top
+    priority - every other priority path never touches it. For those
+    sessions WATI sent the literal string "@amenities" straight through,
+    silently corrupting the amenity-based sort ranking on the majority of
+    real searches (confirmed live for two different phone numbers, both of
+    whom picked a DIFFERENT priority).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import app as app_module
+        cls.app_module = app_module
+
+    def test_bare_at_identifier_is_treated_as_empty(self):
+        for leaked in ["@amenities", "@builder_pref", "@possession_pref", "@x"]:
+            self.assertEqual(self.app_module._clean_incoming(leaked), "", msg=leaked)
+
+    def test_leading_trailing_whitespace_still_matches(self):
+        self.assertEqual(self.app_module._clean_incoming("  @amenities  "), "")
+
+    def test_real_message_containing_at_symbol_is_not_touched(self):
+        # Only a WHOLE-STRING match against the bare @identifier pattern is
+        # stripped - a real customer message that happens to contain "@"
+        # (an email address, or an "@" used conversationally) must survive
+        # untouched, same discipline as the existing {{...}} guard.
+        for real in ["user@example.com", "call me @ 5pm", "my email is a@b.com please"]:
+            self.assertEqual(self.app_module._clean_incoming(real), real, msg=real)
+
+    def test_curly_brace_leak_still_handled_unchanged(self):
+        # Regression guard: adding the @ check must not disturb the
+        # pre-existing {{ }} guard.
+        self.assertEqual(self.app_module._clean_incoming("{{recommendations}}"), "")
+
+    def test_normal_values_pass_through_unchanged(self):
+        for real in ["2 BHK", "1 Cr - 2 Cr", "Goregaon West", ""]:
+            self.assertEqual(self.app_module._clean_incoming(real), real, msg=real)
+
+    @patch("app.search")
+    def test_search_never_receives_a_leaked_amenities_placeholder(self, mock_search):
+        # End-to-end: /search called with the exact malformed body WATI
+        # sent live ("amenities": "@amenities") must call property_core's
+        # search() with amenities="", never the literal garbage string.
+        mock_search.return_value = {
+            "recommendations": "1. Some Project", "count": 1,
+            "shortlist": [{"index": 1, "name": "Some Project", "detail": "",
+                           "image": "", "code": "X1"}],
+            "min_price": "", "max_price": "",
+        }
+        from fastapi.testclient import TestClient
+        client = TestClient(self.app_module.app)
+        resp = client.post("/search", json={
+            "phone": "919999900201", "location": "Goregaon West",
+            "configuration": "2 BHK", "budget": "1 Cr - 2 Cr",
+            "amenities": "@amenities",
+        })
+        self.assertEqual(resp.status_code, 200)
+        mock_search.assert_called_once()
+        self.assertEqual(mock_search.call_args.kwargs.get("amenities", "MISSING"), "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

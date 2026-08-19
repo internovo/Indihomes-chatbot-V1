@@ -1934,4 +1934,123 @@ OS_EVENTS_TIMEOUT=10            # seconds
   module docstring for why guessing at that convention on this side would
   be worse than leaving it to the system that owns it.
 
+---
+
+# CHANGELOG: `@amenities` leaked as a literal Flow Variable, corrupting search ranking
+
+## The evidence
+
+User-reported, backed by real logs from two different phone numbers
+(Pratyush, and a second Hitesh-adjacent session). Both showed this in the
+`lead_routing_client` DRY-RUN log for `/search`:
+
+```
+"amenities": "@amenities",
+```
+
+A literal, unsubstituted WATI Flow Variable, sitting in what should have
+been a real value (or a clean empty string).
+
+## Diagnosis process worth remembering
+
+First instinct was to dismiss this as unrelated - `notify_recommendations()`'s
+caller in `app.py` never includes a `"recommendations"` key at all, so a
+previous question about `{{recommendations}}` showing blank turned out to
+be a red herring from this same log. That correctly-debunked theory almost
+caused the REAL `@amenities` leak sitting three lines away in the same
+payload to be missed too. Lesson: when a user pushes back with "look at
+the conversation again," re-read the WHOLE evidence, not just re-confirm
+the first theory - the same log can contain one red herring and one real
+bug side by side.
+
+## Root cause
+
+`main_webhook-dcBeI` (the `/search` webhook, per `Indihomes_prof_fix_RENAMED.json`)
+unconditionally sends `"amenities":"@amenities"` in its body, every single
+time. But `@amenities` is only ever ASSIGNED a value when the customer
+picks "Amenities" as their top priority - that's the one path that routes
+to `main_question-jzbHS`, the only node that sets it. Every other priority
+choice ("Near Possession", "A Reputed Builder" - which is what BOTH
+affected transcripts took) never touches that variable at all THIS
+session. When a WATI Flow Variable has never been assigned anything in
+the current session - not even blank, genuinely untouched - WATI sends
+the raw unsubstituted `@amenities` text instead of an empty string.
+
+That literal string then landed in `app.py`'s `SearchRequest.amenities`
+field completely unguarded: `_clean_incoming()` only ever defended against
+`{{...}}`-style leaks (the CRITICAL section's long-known Contact Attribute
+case), never `@variable`-style ones.
+
+## Why this corrupted results without zeroing them out
+
+`property_core.search()` treats amenities as a SOFT SCORING signal (sorts
+best-amenity-match first), not a hard filter - which is why properties
+still came back correctly in both transcripts (5 real matches, real
+project codes, confirmed via `lead_routing_client`'s per-code DRY-RUN
+calls). `"@amenities"` never matches any real amenity tag, so it silently
+zeroed out the amenity-scoring boost on every affected search - a quiet
+ranking-quality degradation on the MAJORITY of real searches (anyone who
+didn't pick "Amenities" as their top priority), not a visible failure.
+That's exactly why it went unnoticed until someone actually read a raw
+log line closely.
+
+## The fix
+
+Extended `_clean_incoming()` (the single choke-point every inbound field
+in this file already passes through) to guard against BOTH unsubstituted
+placeholder syntaxes, not just `{{...}}`:
+
+```python
+def _clean_incoming(value: str) -> str:
+    v = (value or "").strip()
+    if v.startswith("{{") and v.endswith("}}"):
+        return ""
+    if re.fullmatch(r"@[A-Za-z_][A-Za-z0-9_]*", v):
+        return ""
+    return v
+```
+
+**Deliberately backend-side, not a WATI-flow patch.** Matches the same
+philosophy already used for the burst-message fix: make the backend
+robust to whatever WATI actually sends, rather than chasing every
+individual flow-wiring quirk one node at a time. This one change protects
+EVERY field that flows through `_clean_incoming()` in every endpoint -
+not just `amenities` on `/search`, but any future field on any future
+endpoint that might hit the same "variable never assigned this session"
+condition.
+
+**Matched narrowly on purpose**: only an EXACT whole-string match against
+a bare `@identifier` shape is stripped (`re.fullmatch`, not `re.search` or
+a `.startswith()` check). A real customer message that merely contains an
+`@` - an email address, a stray `@` in free text - is never touched. Same
+discipline as the pre-existing `{{...}}` guard right above it.
+
+**Not fixed, and deliberately so**: the WATI-side root cause (this
+specific webhook body always sending `@amenities` regardless of which
+priority path was taken) is still there. The backend fix protects THIS
+and every other field from ever leaking garbage into a search or a
+database write again, but the flow itself could still be tightened (e.g.
+only sending `amenities` in the webhook body when the amenities question
+actually ran, or defaulting the flow-level Flow Variable to an empty
+string). Not required given the backend fix already neutralizes the
+symptom, but worth knowing this is a defense-in-depth fix, not a removal
+of the underlying WATI quirk.
+
+## Testing
+
+```powershell
+cd C:\Users\admin\Desktop\Indihomes-chatbot-V1
+python -m unittest tests.test_intent_router -v
+```
+
+New `CleanIncomingAtVariableLeakTests` class: bare `@identifier` leaks
+(`@amenities`, `@builder_pref`, `@possession_pref`, `@x`) all stripped to
+`""`; leading/trailing whitespace still matches; a real message merely
+CONTAINING an `@` (an email address, "call me @ 5pm") is left completely
+untouched; the pre-existing `{{...}}` guard is unaffected; normal values
+pass through unchanged; and an end-to-end `/search` call reproducing the
+exact malformed body WATI sent live (`"amenities": "@amenities"`) asserts
+`property_core.search()` is called with `amenities=""`, never the literal
+garbage string.
+
 

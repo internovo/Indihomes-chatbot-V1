@@ -79,6 +79,7 @@ _ADVISOR_PHRASES = [
 _REJECT_PHRASES = [
     "no one", "none", "none of these", "none of them", "nothing", "not this",
     "not these", "not interested in these", "don't like any", "dont like any",
+    "don't see any", "dont see any", "i don't see any", "i dont see any",
     "not what i want", "not what i'm looking for", "not what im looking for",
 ]
 

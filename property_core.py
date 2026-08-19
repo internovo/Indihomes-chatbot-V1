@@ -18,6 +18,7 @@ Only the loader changed. Live-data quirks handled here (per the API brief):
 import json
 import os
 import re
+import threading
 import time
 from datetime import date
 from typing import List, Dict
@@ -145,7 +146,8 @@ def _normalize(r: Dict) -> Dict:
 PROPERTIES: List[Dict] = []
 KNOWN_LOCALITIES: List[str] = []
 KNOWN_LOCALITIES_LOWER: Dict[str, str] = {}
-_state = {"ts": 0.0, "source": "none", "count": 0}
+_state = {"ts": 0.0, "source": "none", "count": 0, "_refreshing": False}
+_refresh_lock = threading.Lock()  # guards only the "already refreshing?" check itself, not the refresh
 
 
 def _rebuild(raw_list: List[Dict]):
@@ -185,10 +187,53 @@ def load(force: bool = False):
 
 
 def _ensure_fresh():
-    """Cheap TTL check before a search; swallow errors (keep last good)."""
+    """Cheap TTL check before a search - triggers a refresh in the BACKGROUND,
+    never blocks the caller.
+
+    Why this changed: this used to call load(force=True) directly, inline,
+    on whichever customer's /search request happened to land right as the
+    cache expired. load() -> property_api.fetch_all(force=True) can page
+    through the full live catalogue - multiple sequential HTTP calls, each
+    with its own timeout (INDIHOMES_API_TIMEOUT, default 15s). On a slow or
+    many-page refresh that could run long enough to exceed WATI's own
+    webhook timeout - WATI gives up waiting and never captures
+    {{recommendations}} into the Contact Attribute, even though this
+    backend WOULD have returned good data a few seconds later. The customer
+    sees the literal, unsubstituted "{{recommendations}}" token in their
+    WhatsApp message. Confirmed in production (see claude.md) on the MAIN
+    /search flow, not just a fallback path - this earlier documentation's
+    own claim that the primary flow "was never at risk" assumed search()
+    itself was fast, without accounting for this synchronous refresh.
+
+    The fix: a customer's request NEVER waits on a live network call.
+    Stale cache (or even the offline fallback) is served immediately if
+    that's all that's available; the refresh happens on a daemon thread
+    that updates PROPERTIES for the NEXT search once it completes. A
+    background refresh already in flight is not duplicated - only one
+    thread runs at a time, guarded by _refresh_in_progress.
+    """
     ttl = property_api._cache_ttl()
-    if (time.time() - _state["ts"]) > ttl:
-        load(force=True)
+    if (time.time() - _state["ts"]) <= ttl:
+        return
+    if _refresh_lock.acquire(blocking=False):
+        try:
+            if _state["_refreshing"]:
+                return
+            _state["_refreshing"] = True
+        finally:
+            _refresh_lock.release()
+    else:
+        return  # another thread is deciding right now - don't pile on
+
+    def _background_refresh():
+        try:
+            load(force=True)
+        except Exception as e:  # pragma: no cover - load() already swallows its own errors
+            print(f"[property_core] background refresh failed: {e}")
+        finally:
+            _state["_refreshing"] = False
+
+    threading.Thread(target=_background_refresh, daemon=True, name="property-refresh").start()
 
 
 def data_source() -> Dict:

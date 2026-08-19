@@ -66,9 +66,38 @@ _followup_scheduler.start()
 
 
 def _clean_incoming(value: str) -> str:
-    """WATI sometimes sends an unsubstituted {{var}} placeholder. Treat as empty."""
+    """WATI sometimes sends an unsubstituted placeholder instead of the real
+    value, in either of its two variable syntaxes. Treat both as empty.
+
+    Case 1 (already handled): a Contact Attribute reference like
+    {{recommendations}} leaks through literally when that attribute has
+    never been set for this contact.
+
+    Case 2 (added after a real production bug): a Flow Variable reference
+    like @amenities leaks through literally when that variable was never
+    assigned a value THIS session - not just left blank, genuinely never
+    touched. Confirmed live: main_webhook-dcBeI's /search body always
+    sends "amenities":"@amenities", but @amenities is only ever set when
+    the customer picks "Amenities" as their top priority (routing to
+    main_question-jzbHS) - every other priority path (possession, "A
+    Reputed Builder") never assigns it. For those sessions WATI sent the
+    literal string "@amenities" straight through, which silently corrupted
+    the amenity-based sort ranking on every affected search (property_core
+    treats amenities as a soft scoring signal, not a hard filter, so this
+    didn't zero out results - it just quietly degraded ranking quality on
+    the majority of searches). See claude.md for the full transcript and
+    diagnosis.
+
+    Matched narrowly - the ENTIRE trimmed value must look like a bare
+    "@identifier" token and nothing else - so a real customer message that
+    merely contains an "@" (an email address, a stray "@" in free text)
+    is never touched. Only an exact, whole-string match is stripped, same
+    discipline as the {{...}} check above it.
+    """
     v = (value or "").strip()
     if v.startswith("{{") and v.endswith("}}"):
+        return ""
+    if re.fullmatch(r"@[A-Za-z_][A-Za-z0-9_]*", v):
         return ""
     return v
 
