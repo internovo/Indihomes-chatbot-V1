@@ -24,14 +24,34 @@ Run (from the project folder, so it shares appointments.db with the server):
     (base_url defaults to http://localhost:8000)
 """
 
+import os
 import sys
 import time
+import unittest
 
 import requests
 
+# This file is a LIVE smoke script, not a unit test: it talks to a running
+# server over HTTP and calls sys.exit(). `unittest discover` collects it by
+# name anyway, and the module-level requests.get() below then raises during
+# import - which discover reports as a hard ERROR, so CI on main could never
+# be green. Skip unless a server is explicitly nominated.
+#
+# Run it deliberately with:
+#     INDIHOMES_LIVE_BASE_URL=http://localhost:8000 python -m unittest tests.test_pending_clarification_live
+# or, as the docstring above describes, directly:
+#     python tests/test_pending_clarification_live.py [base_url]
+if __name__ != "__main__" and not os.environ.get("INDIHOMES_LIVE_BASE_URL"):
+    raise unittest.SkipTest(
+        "live smoke script - set INDIHOMES_LIVE_BASE_URL to run it against a server"
+    )
+
 import appointments_db
 
-BASE_URL = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
+BASE_URL = (
+    sys.argv[1] if len(sys.argv) > 1
+    else os.environ.get("INDIHOMES_LIVE_BASE_URL") or "http://localhost:8000"
+)
 
 results = []
 

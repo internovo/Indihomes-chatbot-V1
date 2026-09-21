@@ -403,14 +403,26 @@ class MultiPropertySelectionTests(unittest.TestCase):
 
     def setUp(self):
         self.phone = "919999900200"
-        appointments_db.save_shortlist(self.phone, [
-            {"index": 1, "name": "Siddhivinayak", "detail": "2BHK / 2.5BHK, starting 1.22 Cr",
+        # `detail` must carry the project name, because that is what a real
+        # shortlist looks like: property_core.detail_line() renders
+        # "🏙️ *<name>*\n📍 <locality>\n\n🏠 ..." and /search stores that whole
+        # block as the item's detail. An earlier fixture here kept name and
+        # detail separate, which drifted from production and made the
+        # assertions below fail against correct code - /property-detail
+        # joins the `detail` strings, so the names only appear if they are
+        # in them.
+        self.items = [
+            {"index": 1, "name": "Siddhivinayak",
+             "detail": "🏙️ *Siddhivinayak*\n📍 Malad West\n\n2BHK / 2.5BHK, starting 1.22 Cr",
              "image": "img1.png", "code": "SV1"},
-            {"index": 2, "name": "Hitendra Dhamm", "detail": "2BHK / Jodi, starting 1.9 Cr",
+            {"index": 2, "name": "Hitendra Dhamm",
+             "detail": "🏙️ *Hitendra Dhamm*\n📍 Malad East\n\n2BHK / Jodi, starting 1.9 Cr",
              "image": "img2.png", "code": "HD1"},
-            {"index": 3, "name": "Silver Serene", "detail": "2BHK, starting 1.98 Cr",
+            {"index": 3, "name": "Silver Serene",
+             "detail": "🏙️ *Silver Serene*\n📍 Goregaon West\n\n2BHK, starting 1.98 Cr",
              "image": "img3.png", "code": "SS1"},
-        ])
+        ]
+        appointments_db.save_shortlist(self.phone, self.items)
 
     def test_1_and_2_shows_both_properties_not_just_the_first(self):
         # This is THE regression test for the exact bug: the old parser
@@ -456,7 +468,9 @@ class MultiPropertySelectionTests(unittest.TestCase):
         self.assertEqual(body["found"], "yes")
         self.assertEqual(body["count"], 1)
         self.assertEqual(body["name"], "Siddhivinayak")
-        self.assertEqual(body["detail"], "2BHK / 2.5BHK, starting 1.22 Cr")
+        # Compared against the fixture, not a copy of it - a hardcoded string
+        # here is what silently rotted last time the shortlist shape changed.
+        self.assertEqual(body["detail"], self.items[0]["detail"])
 
     def test_three_properties_at_once(self):
         resp = self.client.post("/property-detail", json={
