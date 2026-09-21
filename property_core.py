@@ -32,11 +32,23 @@ DATA_PATH = os.path.join(HERE, "properties.json")
 # --------------------------------------------------------------------------
 # small helpers 
 # --------------------------------------------------------------------------
-def lakh_to_cr(value) -> float:
+def price_to_cr(price) -> float:
+    """startingPrice -> crores, honouring the record's own unit.
+
+    The CRM sends {"value": N, "unit": "lakh"|"Crore"}. Almost every record
+    is in lakh, so this divided by 100 unconditionally for a long time -
+    until INV_MW_441 came back as {"value": 1.79, "unit": "Crore"} and was
+    shown to customers as "starting 0.02 Cr" (confirmed live 2026-09-21).
+    Worse than cosmetic: search() filters on this number, so a 1.79 Cr flat
+    passed an "Under 1 Cr" budget and crowded out everything genuinely in
+    that band. Trust the unit the record carries.
+    """
     try:
-        return round(float(value) / 100.0, 2)
-    except (TypeError, ValueError):
+        v = float((price or {}).get("value"))
+    except (TypeError, ValueError, AttributeError):
         return 0.0
+    unit = str((price or {}).get("unit") or "").strip().lower()
+    return round(v if unit.startswith("cr") else v / 100.0, 2)
 
 
 def months_until(possession: str) -> int:
@@ -124,7 +136,7 @@ def _normalize(r: Dict) -> Dict:
         "location_value": (loc.get("value") or "").strip().lower(),
         "nearby": r.get("nearbyLocality", ""),
         "landmarks": r.get("landmarks") or r.get("nearbyLandmarks") or [],
-        "price_cr": lakh_to_cr(price.get("value")),          # ALWAYS startingPrice
+        "price_cr": price_to_cr(price),                      # ALWAYS startingPrice
         "configs": [str(c).lower().replace(" ", "") for c in (r.get("flatConfiguration") or [])],
         "configs_display": r.get("flatConfiguration") or [],
         "possession_months": months_until(r.get("possessionStartDate", "")),

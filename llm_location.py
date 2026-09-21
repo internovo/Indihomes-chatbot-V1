@@ -435,6 +435,29 @@ def _resolve(extracted: dict, phone: str = "") -> dict:
             return _area_unavailable(phone, loc)
         return _ask_again(phone)
 
+    # normalize_location() expands a bare area through SPLIT_RULES
+    # ("Goregaon" -> Goregaon East + Goregaon West). More than one result IS
+    # an ambiguity, whether or not the LLM flagged it as one - the model
+    # routinely returns ambiguous=false for a bare area name, which used to
+    # fall straight through to the return below and hand the flow a
+    # pipe-joined pair as if the location were resolved. Confirmed in
+    # production 2026-09-21: tapping "Goregaon" skipped the East/West
+    # question entirely and silently searched both. Ask instead.
+    if len(normalized) > 1:
+        opts_list = normalized[:3]
+        if phone:
+            appointments_db.reset_location_retry(phone)
+            # Same as the LLM-flagged branch above: remember what we
+            # offered so a short reply ("west") resolves locally next turn.
+            appointments_db.save_pending_clarification(phone, opts_list)
+        return {
+            "needs_clarification": "yes",
+            "clarify_question": "Just to narrow it down - " + " or ".join(opts_list) + "?",
+            "clarify_options": opts_list,
+            "normalized_location": "",
+            "handoff": "no",
+        }
+
     if phone:
         appointments_db.reset_location_retry(phone)
         # A clarification (if any was pending) is now resolved via the
