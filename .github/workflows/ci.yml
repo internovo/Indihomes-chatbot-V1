@@ -1,0 +1,66 @@
+# CI for Indihomes chatbot V1. Tests only - this workflow does NOT deploy.
+#
+# It used to deploy to an Azure App Service staging slot
+# (azure/webapps-deploy@v3, app "indihomes-chatbot-v1", then a manual slot
+# swap). That was written before the target was settled and never worked:
+# production is a bare Ubuntu VM (indihomes-prod-az) running uvicorn under
+# systemd behind nginx, and no App Service by that name exists in the
+# subscription - the only two are indihomes-lead-routing-service and
+# app-propog-api, neither of which is this app. On merge the job would fail
+# at azure/login or azure/webapps-deploy, which is noise, and if an App
+# Service with that name were ever created it would start shipping there
+# instead of to the live VM. Removed rather than left to rot.
+#
+# How production is actually deployed today (manual, from a workstation
+# with the VM's SSH key):
+#
+#   git archive --format=tar HEAD > /tmp/v1.tar
+#   scp /tmp/v1.tar azureuser@<vm>:/tmp/
+#   ssh azureuser@<vm> 'cd /opt/indihomes-v1 && tar -xf /tmp/v1.tar'
+#   ssh azureuser@<vm> 'cd /opt/indihomes-v1 && .venv/bin/python -m unittest discover -s tests'
+#   # then, only once the nginx log shows no request in the last 60s:
+#   ssh azureuser@<vm> 'sudo systemctl restart indihomes-v1'
+#
+# Only tracked files ship, so .env and credentials never leave the VM. The
+# restart is gated on an idle window because a restart mid-conversation
+# drops whatever WATI is waiting on.
+#
+# Automating that needs a deploy key in repository secrets and an agreed
+# restart policy - a deliberate decision, not something to bolt back on
+# here. Until then this workflow's job is to keep main green.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run test suite
+        # No GROQ_API_KEY / Google creds needed: the suite mocks every
+        # outbound call. If a test ever starts needing a real key, that
+        # test is doing too much - fix the test, do not add the secret.
+        run: python -m unittest discover -s tests -v
