@@ -35,6 +35,7 @@ The 24-hour session window:
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Optional
 
@@ -58,6 +59,36 @@ def is_configured() -> bool:
 
 
 # ---- shared HTTP helper -----------------------------------------------------
+
+def _body_says_ok(body: str) -> tuple:
+    """(ok, info) from a WATI 2xx response body.
+
+    WATI signals a REJECTED send inside a 200 response, not with a status
+    code: {"result": false, "info": "Invalid Conversation"}. A successful
+    send answers {"ok": true, "result": "success", "message": {...}} — note
+    `result` is the STRING "success" there, not a boolean, so this cannot
+    just be `bool(result)`.
+
+    Deliberately conservative: only an explicit failure marker returns False.
+    A body we can't parse, or one with no `result`/`ok` field at all, counts
+    as success — this helper must never turn a real delivery into a retry
+    loop just because WATI changed its response shape.
+    """
+    try:
+        data = json.loads(body)
+    except Exception:
+        return True, ""
+    if not isinstance(data, dict):
+        return True, ""
+    info = str(data.get("info") or data.get("message") or "").strip()
+    result = data.get("result")
+    if result is False or (isinstance(result, str)
+                           and result.strip().lower() in ("false", "failed", "error")):
+        return False, info or "result=false"
+    if data.get("ok") is False:
+        return False, info or "ok=false"
+    return True, ""
+
 
 def _post_json(url: str, payload: dict) -> bool:
     """POST JSON to `url` with the WATI authorization header.
@@ -83,7 +114,23 @@ def _post_json(url: str, payload: dict) -> bool:
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
-            return 200 <= resp.status < 300
+            if not (200 <= resp.status < 300):
+                return False
+            try:
+                body = resp.read().decode("utf-8", "replace")
+            except Exception:
+                return True  # 2xx but unreadable body - nothing better to go on
+            ok, info = _body_says_ok(body)
+            if not ok:
+                # WATI answers 200 on a REJECTED send, putting the real
+                # outcome in the body: {"result":false,"info":"..."}.
+                # Confirmed live 2026-09-21 - "Invalid Conversation" for a
+                # phone with no open session, and "message text can not be
+                # empty" when messageText was passed in the JSON body. Both
+                # were reported as successful sends for months because this
+                # helper only ever looked at the HTTP status.
+                print(f"[wati_client] WATI rejected the send (HTTP 200): {info}")
+            return ok
     except urllib.error.HTTPError as e:
         try:
             detail = e.read().decode("utf-8")[:300]
@@ -163,8 +210,15 @@ def send_session_message(phone: str, text: str) -> bool:
         print("[wati_client] WATI not configured — skipping send_session_message")
         return False
 
-    url = f"https://{_endpoint()}/api/v1/sendSessionMessage/{phone}"
-    payload = {"messageText": text}
+    # messageText MUST go in the query string, not the JSON body. WATI
+    # ignores a body here and answers 200 with
+    # {"result":false,"info":"message text can not be empty"} - so every
+    # session message ever sent from this client silently did nothing
+    # (confirmed live 2026-09-21). Phase 2's client already does it this
+    # way; see Indiihomes-chatbot-phase2 integrations/wati_client.py.
+    qs = urllib.parse.urlencode({"messageText": text})
+    url = f"https://{_endpoint()}/api/v1/sendSessionMessage/{phone}?{qs}"
+    payload = {}
 
     ok = _post_json(url, payload)
     if ok:
